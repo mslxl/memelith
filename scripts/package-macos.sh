@@ -14,7 +14,7 @@ cd "${workspace_root}"
 export CARGO_TARGET_DIR="${target_directory}"
 export MACOSX_DEPLOYMENT_TARGET="14.0"
 
-cargo bundle --package memelith --release --format osx
+cargo bundle --package memelith --bin memelith --release --format osx
 
 (
     cd "${app_bundle}/Contents"
