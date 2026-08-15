@@ -140,10 +140,23 @@ jobs:
             *) printf 'Unsupported macOS architecture: %s\n' "${arch}" >&2; exit 1 ;;
           esac
 
+          app='target/macos-bundle/release/bundle/osx/Memelith.app'
+          [[ -d "${app}" ]] || { printf 'macOS application bundle was not produced: %s\n' "${app}" >&2; exit 1; }
+
           mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent \
-            target/macos-bundle/release/bundle/osx/Memelith.app \
-            "dist/memelith-${RELEASE_VERSION}-macos-${arch}.zip"
+          staging="$(mktemp -d)"
+          trap 'rm -rf "${staging}"' EXIT
+          cp -R "${app}" "${staging}/Memelith.app"
+          ln -s /Applications "${staging}/Applications"
+
+          dmg="dist/memelith-${RELEASE_VERSION}-macos-${arch}.dmg"
+          hdiutil create \
+            -volname "Memelith ${RELEASE_VERSION}" \
+            -srcfolder "${staging}" \
+            -ov \
+            -format UDZO \
+            "${dmg}"
+          [[ -f "${dmg}" ]] || { printf 'hdiutil did not produce a DMG: %s\n' "${dmg}" >&2; exit 1; }
 
       - name: Build Linux packages
         if: matrix.platform == 'linux'
