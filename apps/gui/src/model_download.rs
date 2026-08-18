@@ -1,11 +1,12 @@
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
-use reqwest::blocking::Client;
+use reqwest::{StatusCode, blocking::Client, header::RANGE};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -13,6 +14,9 @@ const APPLICATION_MODELS_DIRECTORY: &str = "memelith/models";
 const CLIP_DIRECTORY: &str = "chinese-clip-vit-base-patch16";
 const WAIFU_DIRECTORY: &str = "ml-danbooru";
 const DOWNLOAD_BUFFER_BYTES: usize = 1024 * 1024;
+const INSTALLATION_MARKER_FILENAME: &str = ".models-installed.json";
+const INSTALLATION_MARKER_SCHEMA: u32 = 1;
+const ALL_MODELS_LABEL: &str = "本地模型";
 
 const CLIP_MODEL_MANIFEST: &[u8] =
     include_bytes!("../../../crates/clip/assets/models/chinese-clip-vit-base-patch16/model.json");
@@ -126,6 +130,22 @@ struct RemoteAsset {
     sha256: &'static str,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct InstallationMarker {
+    schema: u32,
+    assets: Vec<InstallationMarkerAsset>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct InstallationMarkerAsset {
+    directory: String,
+    filename: String,
+    size: u64,
+    sha256: String,
+    modified_seconds: u64,
+    modified_nanos: u32,
+}
+
 pub fn ensure_default_models(
     mut on_progress: impl FnMut(ModelInstallProgress),
 ) -> Result<InstalledModels> {
@@ -149,6 +169,16 @@ fn ensure_models_in(
     write_embedded_file(&clip_directory.join("NOTICE.md"), CLIP_NOTICE)?;
 
     let total_bytes = REMOTE_ASSETS.iter().map(|asset| asset.size).sum();
+    if installation_marker_matches(root) {
+        on_progress(ModelInstallProgress {
+            phase: ModelInstallPhase::Checking,
+            asset_label: ALL_MODELS_LABEL,
+            completed_bytes: total_bytes,
+            total_bytes,
+        });
+        return Ok(installed_models(root, clip_directory));
+    }
+
     let client = Client::builder()
         .user_agent(concat!("Memelith/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
@@ -166,6 +196,7 @@ fn ensure_models_in(
             total_bytes,
         });
         if verify_file(&path, asset.size, asset.sha256)? {
+            remove_file_if_exists(&temporary_path(&directory, asset.filename))?;
             completed_bytes += asset.size;
             on_progress(ModelInstallProgress {
                 phase: ModelInstallPhase::Checking,
@@ -176,7 +207,48 @@ fn ensure_models_in(
             continue;
         }
 
-        let response = client.get(asset.url).send()?.error_for_status()?;
+        let temporary = temporary_path(&directory, asset.filename);
+        let mut partial_size = match fs::metadata(&temporary) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) => {
+                remove_file_if_exists(&temporary)?;
+                0
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        if partial_size > asset.size {
+            remove_file_if_exists(&temporary)?;
+            partial_size = 0;
+        }
+        if partial_size == asset.size {
+            if verify_file(&temporary, asset.size, asset.sha256)? {
+                fs::rename(&temporary, &path)?;
+                completed_bytes += asset.size;
+                on_progress(ModelInstallProgress {
+                    phase: ModelInstallPhase::Checking,
+                    asset_label: asset.label,
+                    completed_bytes,
+                    total_bytes,
+                });
+                continue;
+            }
+            remove_file_if_exists(&temporary)?;
+            partial_size = 0;
+        }
+
+        let mut request = client.get(asset.url);
+        if partial_size > 0 {
+            request = request.header(RANGE, format!("bytes={partial_size}-"));
+        }
+        let response = request.send()?;
+        if partial_size > 0
+            && response.status() != StatusCode::PARTIAL_CONTENT
+            && response.status().is_success()
+        {
+            remove_file_if_exists(&temporary)?;
+        }
+        let response = response.error_for_status()?;
         install_asset_from_reader(
             &directory,
             asset.filename,
@@ -195,12 +267,17 @@ fn ensure_models_in(
         completed_bytes += asset.size;
     }
 
-    Ok(InstalledModels {
+    write_installation_marker(root)?;
+    Ok(installed_models(root, clip_directory))
+}
+
+fn installed_models(root: &Path, clip_directory: PathBuf) -> InstalledModels {
+    InstalledModels {
         clip_directory,
         waifu_model_path: root
             .join(WAIFU_DIRECTORY)
             .join("ml_caformer_m36_dec-5-97527.onnx"),
-    })
+    }
 }
 
 fn install_asset_from_reader(
@@ -214,13 +291,35 @@ fn install_asset_from_reader(
     fs::create_dir_all(directory)?;
     let destination = directory.join(filename);
     let temporary = temporary_path(directory, filename);
-    remove_file_if_exists(&temporary)?;
+    let existing_size = match fs::metadata(&temporary) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => {
+            remove_file_if_exists(&temporary)?;
+            0
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
 
     let installation = (|| {
-        let mut file = File::create(&temporary)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&temporary)?;
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
-        let mut actual_size = 0_u64;
+        let mut actual_size = existing_size;
+        if existing_size > 0 {
+            let mut existing = File::open(&temporary)?;
+            loop {
+                let read = existing.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            on_progress(existing_size);
+        }
         loop {
             let read = reader.read(&mut buffer)?;
             if read == 0 {
@@ -255,7 +354,11 @@ fn install_asset_from_reader(
     })();
 
     if let Err(source) = installation {
-        if let Err(cleanup) = remove_file_if_exists(&temporary) {
+        let keep_partial = matches!(
+            &source,
+            ModelInstallError::Io(_) | ModelInstallError::SizeMismatch { .. }
+        );
+        if !keep_partial && let Err(cleanup) = remove_file_if_exists(&temporary) {
             return Err(ModelInstallError::Cleanup {
                 path: temporary,
                 source: Box::new(source),
@@ -265,6 +368,80 @@ fn install_asset_from_reader(
         return Err(source);
     }
     Ok(())
+}
+
+fn installation_marker_matches(root: &Path) -> bool {
+    let marker_path = root.join(INSTALLATION_MARKER_FILENAME);
+    let Ok(bytes) = fs::read(marker_path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<InstallationMarker>(&bytes) else {
+        return false;
+    };
+    if marker.schema != INSTALLATION_MARKER_SCHEMA || marker.assets.len() != REMOTE_ASSETS.len() {
+        return false;
+    }
+
+    REMOTE_ASSETS
+        .iter()
+        .zip(marker.assets.iter())
+        .all(|(asset, record)| {
+            if record.directory != asset.directory
+                || record.filename != asset.filename
+                || record.size != asset.size
+                || record.sha256 != asset.sha256
+            {
+                return false;
+            }
+            let path = root.join(asset.directory).join(asset.filename);
+            let Ok(metadata) = fs::metadata(path) else {
+                return false;
+            };
+            if !metadata.is_file() || metadata.len() != asset.size {
+                return false;
+            }
+            let Some((modified_seconds, modified_nanos)) = modification_time(&metadata) else {
+                return false;
+            };
+            modified_seconds == record.modified_seconds && modified_nanos == record.modified_nanos
+        })
+}
+
+fn write_installation_marker(root: &Path) -> Result<()> {
+    let assets = REMOTE_ASSETS
+        .iter()
+        .map(|asset| {
+            let path = root.join(asset.directory).join(asset.filename);
+            let metadata = fs::metadata(path)?;
+            let (modified_seconds, modified_nanos) =
+                modification_time(&metadata).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "model file has no usable modification time",
+                    )
+                })?;
+            Ok(InstallationMarkerAsset {
+                directory: asset.directory.to_owned(),
+                filename: asset.filename.to_owned(),
+                size: asset.size,
+                sha256: asset.sha256.to_owned(),
+                modified_seconds,
+                modified_nanos,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let marker = InstallationMarker {
+        schema: INSTALLATION_MARKER_SCHEMA,
+        assets,
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    write_embedded_file(&root.join(INSTALLATION_MARKER_FILENAME), &bytes)
+}
+
+fn modification_time(metadata: &fs::Metadata) -> Option<(u64, u32)> {
+    let elapsed = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((elapsed.as_secs(), elapsed.subsec_nanos()))
 }
 
 fn verify_file(path: &Path, expected_size: u64, expected_sha256: &str) -> Result<bool> {

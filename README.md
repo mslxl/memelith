@@ -73,8 +73,10 @@ The macOS application bundle does not contain the ONNX models. On first launch,
 the GUI downloads about 992 MiB of pinned model files, verifies their byte sizes
 and SHA-256 digests, and stores them under
 `~/Library/Application Support/memelith/models`. A network connection is
-therefore required the first time the app starts. Later launches verify and
-reuse the cached files; missing or invalid files are downloaded again.
+therefore required the first time the app starts. Completed installations use a
+lightweight metadata receipt on later launches instead of hashing every model
+again, and interrupted downloads resume from the saved partial file. Missing
+or invalid files are downloaded again.
 
 The repository does not contain ONNX model binaries. Their pinned download or
 export sources, together with the GUI download artifacts, are listed in
