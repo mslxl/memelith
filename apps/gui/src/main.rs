@@ -3524,8 +3524,8 @@ impl MemelithView {
             .flex_col()
             .child(
                 div()
-                    .w_full()
-                    .max_w(px(520.))
+                    .w(px(520.))
+                    .max_w_full()
                     .flex_none()
                     .pb_5()
                     .flex()
