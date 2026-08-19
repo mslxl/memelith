@@ -83,6 +83,7 @@ pub enum TelegramBotStatus {
     Starting,
     LoadingModel,
     Running,
+    CollectorUpdated,
     StickerPackSyncStarted {
         pack_id: Uuid,
     },
@@ -1136,6 +1137,7 @@ fn handle_media(
             .map_err(|_| TelegramError::Api("database lock was poisoned".to_owned()))?;
         collect_incoming_media(&mut database, &media, source_file.path(), preview_path)?;
         drop(database);
+        let _ = state.status.send(TelegramBotStatus::CollectorUpdated);
         if !delete_message_or_queue(&state, message.chat.id, message.message_id)? {
             log_api_result(
                 "send source deletion warning",
@@ -1334,6 +1336,7 @@ fn handle_callback(state: Arc<BotState>, callback: CallbackQuery) -> Result<(), 
             );
             return Err(error.into());
         }
+        let _ = state.status.send(TelegramBotStatus::CollectorUpdated);
     } else if action != "discard" {
         return Err(TelegramError::InvalidCallback);
     }

@@ -505,6 +505,7 @@ struct MemelithView {
     pack_names: HashMap<Uuid, String>,
     tags: Vec<Tag>,
     collector_items: Vec<CollectorItem>,
+    collector_refresh_pending: bool,
     selected_collector_items: HashSet<Uuid>,
     draft_contents: Vec<DraftContent>,
     active_draft_image: usize,
@@ -568,6 +569,7 @@ impl MemelithView {
             pack_names: HashMap::new(),
             tags: Vec::new(),
             collector_items: Vec::new(),
+            collector_refresh_pending: false,
             selected_collector_items: HashSet::new(),
             draft_contents: Vec::new(),
             active_draft_image: 0,
@@ -752,6 +754,7 @@ impl MemelithView {
                         view.pack_names = opened.pack_names;
                         view.tags = opened.tags;
                         view.collector_items = opened.collector_items;
+                        view.collector_refresh_pending = false;
                         view.selected_collector_items.clear();
                         view.collector_context_menu = None;
                         view.reset_add_form(cx);
@@ -911,6 +914,16 @@ impl MemelithView {
                         if message == "Telegram 设置已保存，Bot 正在启动"
                 ) {
                     self.notice = Some(Notice::Success("Telegram Bot 已启动".to_owned()));
+                }
+            }
+            telegram::TelegramBotStatus::CollectorUpdated => {
+                self.collector_refresh_pending = true;
+                if self.database.is_some()
+                    && let Err(error) = self.refresh_collector()
+                {
+                    self.notice = Some(Notice::Error(format!(
+                        "Telegram 已更新 Collector，但刷新界面失败：{error}"
+                    )));
                 }
             }
             telegram::TelegramBotStatus::StickerPackSyncStarted { pack_id } => {
@@ -1244,6 +1257,13 @@ impl MemelithView {
                     } else {
                         None
                     };
+                    if view.collector_refresh_pending
+                        && let Err(error) = view.refresh_collector()
+                    {
+                        view.notice = Some(Notice::Error(format!(
+                            "Telegram 已更新 Collector，但刷新界面失败：{error}"
+                        )));
+                    }
                     cx.notify();
                 });
             }
@@ -2203,7 +2223,22 @@ impl MemelithView {
         self.meme_packs = packs;
         self.memes = memes;
         self.tags = tags;
+        self.apply_collector_items(collector_items);
+        Ok(())
+    }
+
+    fn refresh_collector(&mut self) -> Result<(), memelith_core::Error> {
+        let database = self.database.as_ref().ok_or_else(|| {
+            memelith_core::Error::InvalidDatabase("database is not open".to_owned())
+        })?;
+        let collector_items = database.list_collector_items()?;
+        self.apply_collector_items(collector_items);
+        Ok(())
+    }
+
+    fn apply_collector_items(&mut self, collector_items: Vec<CollectorItem>) {
         self.collector_items = collector_items;
+        self.collector_refresh_pending = false;
         let selectable_ids = self
             .collector_items
             .iter()
@@ -2212,7 +2247,6 @@ impl MemelithView {
             .collect::<HashSet<_>>();
         self.selected_collector_items
             .retain(|id| selectable_ids.contains(id));
-        Ok(())
     }
 
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
