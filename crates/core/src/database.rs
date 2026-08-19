@@ -1014,6 +1014,52 @@ impl MemeDatabase {
             .map_err(Error::from)
     }
 
+    pub fn list_all_meme_effective_tags(&self) -> Result<Vec<(Uuid, EffectiveTag)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT meme_id, tag_id, name, MAX(is_direct), MAX(is_inherited)
+             FROM (
+                 SELECT
+                     mt.meme_id AS meme_id,
+                     t.id AS tag_id,
+                     t.name AS name,
+                     t.normalized_name AS normalized_name,
+                     1 AS is_direct,
+                     0 AS is_inherited
+                 FROM meme_tags mt
+                 JOIN tags t ON t.id = mt.tag_id
+                 UNION ALL
+                 SELECT
+                     m.id AS meme_id,
+                     t.id AS tag_id,
+                     t.name AS name,
+                     t.normalized_name AS normalized_name,
+                     0 AS is_direct,
+                     1 AS is_inherited
+                 FROM memes m
+                 JOIN meme_pack_tags pt ON pt.meme_pack_id = m.meme_pack_id
+                 JOIN tags t ON t.id = pt.tag_id
+             )
+             GROUP BY meme_id, tag_id, name, normalized_name
+             ORDER BY meme_id, normalized_name, tag_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    uuid_from_column(row, 0)?,
+                    EffectiveTag {
+                        tag: Tag {
+                            id: uuid_from_column(row, 1)?,
+                            name: row.get(2)?,
+                        },
+                        direct: row.get(3)?,
+                        inherited: row.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
     fn embed_text(&mut self, field: &'static str, text: &str) -> Result<Vec<u8>> {
         let vector = self
             .embedding_provider

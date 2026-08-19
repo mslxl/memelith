@@ -485,6 +485,7 @@ struct OpenedLibrary {
     database: MemeDatabase,
     inbox_id: Uuid,
     memes: Vec<Meme>,
+    meme_tags: HashMap<Uuid, Vec<Tag>>,
     meme_packs: Vec<MemePack>,
     pack_names: HashMap<Uuid, String>,
     tags: Vec<Tag>,
@@ -501,6 +502,7 @@ struct MemelithView {
     inbox_id: Option<Uuid>,
     page: Page,
     memes: Vec<Meme>,
+    meme_tags: HashMap<Uuid, Vec<Tag>>,
     meme_packs: Vec<MemePack>,
     pack_names: HashMap<Uuid, String>,
     tags: Vec<Tag>,
@@ -542,7 +544,7 @@ impl MemelithView {
         saved_telegram: Result<settings::TelegramSettings, settings::SettingsError>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let tags_input = cx.new(|cx| TextInput::new("用逗号分隔，例如：猫猫, 反应", cx));
+        let tags_input = cx.new(|cx| TextInput::new("输入 key:value，多个标签用逗号分隔", cx));
         let text_content_input = cx.new(|cx| TextInput::new("输入 Meme 文字", cx));
         let meme_search_input = cx.new(|cx| TextInput::new("搜索 Meme", cx));
         let telegram_token_input = cx.new(|cx| TextInput::new("粘贴 BotFather 提供的 token", cx));
@@ -565,6 +567,7 @@ impl MemelithView {
             inbox_id: None,
             page: Page::All,
             memes: Vec::new(),
+            meme_tags: HashMap::new(),
             meme_packs: Vec::new(),
             pack_names: HashMap::new(),
             tags: Vec::new(),
@@ -750,6 +753,7 @@ impl MemelithView {
                         view.storage_root = Some(canonical_root.clone());
                         view.inbox_id = Some(opened.inbox_id);
                         view.memes = opened.memes;
+                        view.meme_tags = opened.meme_tags;
                         view.meme_packs = opened.meme_packs;
                         view.pack_names = opened.pack_names;
                         view.tags = opened.tags;
@@ -1875,8 +1879,16 @@ impl MemelithView {
             }
         }
 
+        let character_tags = characters
+            .iter()
+            .map(|character| format!("character:{character}"))
+            .collect::<Vec<_>>();
         let current_tags = self.tags_input.read(cx).text();
-        let (merged_tags, added_characters) = merge_tags(&current_tags, &characters);
+        let (merged_tags, added_character_tags) = merge_tags(&current_tags, &character_tags);
+        let added_characters = added_character_tags
+            .iter()
+            .filter_map(|tag| split_tag(tag).map(|(_, value)| value.to_owned()))
+            .collect::<Vec<_>>();
         if !added_characters.is_empty() {
             self.tags_input
                 .update(cx, |input, cx| input.set_text(merged_tags, cx));
@@ -2098,7 +2110,17 @@ impl MemelithView {
         };
         let name = optional_input_text(&self.name_input.read(cx).text());
         let description = optional_input_text(&self.description_input.read(cx).text());
-        let tags = parse_tags(&self.tags_input.read(cx).text());
+        let tags = match parse_tag_input(&self.tags_input.read(cx).text()) {
+            Ok(tags) => tags,
+            Err(invalid_tags) => {
+                self.notice = Some(Notice::Error(format!(
+                    "Tag 必须使用 key:value 格式：{}",
+                    invalid_tags.join("、")
+                )));
+                cx.notify();
+                return;
+            }
+        };
         let collector_ids = self
             .draft_contents
             .iter()
@@ -2243,6 +2265,7 @@ impl MemelithView {
         })?;
         let packs = database.list_meme_packs()?;
         let memes = database.list_all_memes()?;
+        let meme_tags = load_meme_tags(database)?;
         let tags = database.list_tags()?;
         let collector_items = database.recheck_collector_items()?;
         self.pack_names = packs
@@ -2251,6 +2274,7 @@ impl MemelithView {
             .collect();
         self.meme_packs = packs;
         self.memes = memes;
+        self.meme_tags = meme_tags;
         self.tags = tags;
         self.apply_collector_items(collector_items);
         Ok(())
@@ -3344,6 +3368,11 @@ impl MemelithView {
     fn render_tag_field(&self, cx: &mut Context<Self>) -> AnyElement {
         let input_text = self.tags_input.read(cx).text();
         let suggestions = tag_suggestions(&input_text, &self.tags);
+        let preview_tags = parse_tags(&input_text)
+            .into_iter()
+            .filter(|tag| split_tag(tag).is_some())
+            .collect::<Vec<_>>();
+        let preview_groups = group_tags(preview_tags.iter().map(String::as_str));
         let mut input_column = div()
             .flex_1()
             .min_w_0()
@@ -3351,6 +3380,15 @@ impl MemelithView {
             .flex_col()
             .gap_2()
             .child(self.tags_input.clone());
+
+        if !preview_groups.is_empty() {
+            input_column = input_column.child(
+                div()
+                    .w_full()
+                    .pt_1()
+                    .child(render_tag_groups(preview_groups, false)),
+            );
+        }
 
         if !suggestions.is_empty() {
             let mut suggestion_list = div()
@@ -3609,6 +3647,10 @@ impl MemelithView {
                         expression.matches(
                             meme,
                             self.pack_names.get(&meme.meme_pack_id).map(String::as_str),
+                            self.meme_tags
+                                .get(&meme.id)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
                         )
                     })
                 })
@@ -3709,6 +3751,11 @@ impl MemelithView {
     }
 
     fn render_meme(&self, index: usize, meme: &Meme) -> AnyElement {
+        let tag_groups = self
+            .meme_tags
+            .get(&meme.id)
+            .map(|tags| group_tags(tags.iter().map(|tag| tag.name.as_str())))
+            .unwrap_or_default();
         let preview = meme
             .contents
             .iter()
@@ -3837,6 +3884,14 @@ impl MemelithView {
                                 .text_color(rgba(LABEL_2))
                                 .truncate()
                                 .child(description.clone()),
+                        )
+                    })
+                    .when(!tag_groups.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .w_full()
+                                .pt_2()
+                                .child(render_tag_groups(tag_groups, true)),
                         )
                     }),
             )
@@ -4353,12 +4408,14 @@ fn open_library(storage_root: &Path, model_directory: &Path) -> Result<OpenedLib
     };
     let packs = database.list_meme_packs()?;
     let memes = database.list_all_memes()?;
+    let meme_tags = load_meme_tags(&database)?;
     let tags = database.list_tags()?;
     let collector_items = database.recheck_collector_items()?;
     Ok(OpenedLibrary {
         database,
         inbox_id,
         memes,
+        meme_tags,
         pack_names: packs
             .iter()
             .map(|pack| (pack.id, pack.name.clone()))
@@ -4367,6 +4424,19 @@ fn open_library(storage_root: &Path, model_directory: &Path) -> Result<OpenedLib
         tags,
         collector_items,
     })
+}
+
+fn load_meme_tags(
+    database: &MemeDatabase,
+) -> Result<HashMap<Uuid, Vec<Tag>>, memelith_core::Error> {
+    let mut meme_tags = HashMap::<Uuid, Vec<Tag>>::new();
+    for (meme_id, effective_tag) in database.list_all_meme_effective_tags()? {
+        meme_tags
+            .entry(meme_id)
+            .or_default()
+            .push(effective_tag.tag);
+    }
+    Ok(meme_tags)
 }
 
 fn field_row(label: impl Into<SharedString>, input: Entity<TextInput>) -> AnyElement {
@@ -4417,6 +4487,19 @@ fn optional_input_text(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+#[derive(Debug)]
+struct TagGroup {
+    key: String,
+    values: Vec<String>,
+}
+
+fn split_tag(value: &str) -> Option<(&str, &str)> {
+    let (key, value) = value.split_once(':')?;
+    let key = key.trim();
+    let value = value.trim();
+    (!key.is_empty() && !value.is_empty()).then_some((key, value))
+}
+
 fn parse_tags(value: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     value
@@ -4424,6 +4507,112 @@ fn parse_tags(value: &str) -> Vec<String> {
         .filter_map(optional_input_text)
         .filter(|tag| seen.insert(tag.to_ascii_lowercase()))
         .collect()
+}
+
+fn parse_tag_input(value: &str) -> Result<Vec<String>, Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut tags = Vec::new();
+    let mut invalid = Vec::new();
+    for tag in parse_tags(value) {
+        let Some((key, value)) = split_tag(&tag) else {
+            invalid.push(tag);
+            continue;
+        };
+        let tag = format!("{key}:{value}");
+        if seen.insert(tag.to_lowercase()) {
+            tags.push(tag);
+        }
+    }
+    if invalid.is_empty() {
+        Ok(tags)
+    } else {
+        Err(invalid)
+    }
+}
+
+fn group_tags<'a>(tags: impl IntoIterator<Item = &'a str>) -> Vec<TagGroup> {
+    let mut groups = Vec::<TagGroup>::new();
+    let mut group_indexes = HashMap::<String, usize>::new();
+    let mut seen_values = HashMap::<String, HashSet<String>>::new();
+    for tag in tags {
+        let (key, value) = split_tag(tag).unwrap_or(("mixed", tag.trim()));
+        if value.is_empty() {
+            continue;
+        }
+        let normalized_key = key.to_lowercase();
+        let index = *group_indexes
+            .entry(normalized_key.clone())
+            .or_insert_with(|| {
+                let index = groups.len();
+                groups.push(TagGroup {
+                    key: key.to_owned(),
+                    values: Vec::new(),
+                });
+                index
+            });
+        let normalized_value = value.to_lowercase();
+        if seen_values
+            .entry(normalized_key)
+            .or_default()
+            .insert(normalized_value)
+        {
+            groups[index].values.push(value.to_owned());
+        }
+    }
+    groups
+}
+
+fn render_tag_groups(groups: Vec<TagGroup>, compact: bool) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .children(groups.into_iter().map(move |group| {
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(tag_label(group.key, true, compact))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .children(
+                            group
+                                .values
+                                .into_iter()
+                                .map(move |value| tag_label(value, false, compact)),
+                        ),
+                )
+        }))
+        .into_any_element()
+}
+
+fn tag_label(label: String, key: bool, compact: bool) -> Div {
+    div()
+        .h(if compact { px(22.) } else { px(26.) })
+        .max_w_full()
+        .px(if compact { px(9.) } else { px(11.) })
+        .flex_none()
+        .rounded_full()
+        .bg(if key {
+            rgba(0x3c3c4324)
+        } else {
+            rgba(0x3c3c4318)
+        })
+        .text_color(rgb(INK))
+        .text_size(if compact { px(11.) } else { px(13.) })
+        .when(key, |element| element.font_weight(FontWeight::MEDIUM))
+        .flex()
+        .items_center()
+        .truncate()
+        .child(label)
 }
 
 fn merge_tags(value: &str, additions: &[String]) -> (String, Vec<String>) {
@@ -4461,6 +4650,7 @@ fn tag_suggestions<'a>(value: &str, tags: &'a [Tag]) -> Vec<&'a Tag> {
     let mut matches = tags
         .iter()
         .filter_map(|tag| {
+            split_tag(&tag.name)?;
             let normalized_name = tag.name.to_lowercase();
             if selected.contains(&normalized_name) {
                 return None;

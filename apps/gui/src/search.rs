@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use memelith_core::{Meme, MemeContent};
+use memelith_core::{Meme, MemeContent, Tag};
 use nom::{
     IResult, Parser,
     branch::alt,
@@ -52,8 +52,8 @@ impl SearchExpression {
         }))
     }
 
-    pub(crate) fn matches(&self, meme: &Meme, pack_name: Option<&str>) -> bool {
-        self.root.matches(meme, pack_name)
+    pub(crate) fn matches(&self, meme: &Meme, pack_name: Option<&str>, tags: &[Tag]) -> bool {
+        self.root.matches(meme, pack_name, tags)
     }
 }
 
@@ -88,15 +88,15 @@ enum Expression {
 }
 
 impl Expression {
-    fn matches(&self, meme: &Meme, pack_name: Option<&str>) -> bool {
+    fn matches(&self, meme: &Meme, pack_name: Option<&str>, tags: &[Tag]) -> bool {
         match self {
-            Self::Term(term) => term.matches(meme, pack_name),
-            Self::Not(expression) => !expression.matches(meme, pack_name),
+            Self::Term(term) => term.matches(meme, pack_name, tags),
+            Self::Not(expression) => !expression.matches(meme, pack_name, tags),
             Self::And(left, right) => {
-                left.matches(meme, pack_name) && right.matches(meme, pack_name)
+                left.matches(meme, pack_name, tags) && right.matches(meme, pack_name, tags)
             }
             Self::Or(left, right) => {
-                left.matches(meme, pack_name) || right.matches(meme, pack_name)
+                left.matches(meme, pack_name, tags) || right.matches(meme, pack_name, tags)
             }
         }
     }
@@ -111,6 +111,7 @@ enum Field {
     Text,
     Type,
     Content,
+    Tag,
 }
 
 impl Field {
@@ -123,6 +124,7 @@ impl Field {
             "text" => Some(Self::Text),
             "type" | "format" => Some(Self::Type),
             "content" | "contents" => Some(Self::Content),
+            "tag" | "tags" => Some(Self::Tag),
             _ => None,
         }
     }
@@ -241,7 +243,7 @@ struct SearchTerm {
 }
 
 impl SearchTerm {
-    fn matches(&self, meme: &Meme, pack_name: Option<&str>) -> bool {
+    fn matches(&self, meme: &Meme, pack_name: Option<&str>, tags: &[Tag]) -> bool {
         match self.field {
             Field::All => {
                 self.matcher
@@ -252,6 +254,7 @@ impl SearchTerm {
                     || self.matcher.matches_values(pack_name.into_iter())
                     || self.matcher.matches_values(text_values(meme))
                     || self.matcher.matches_values(type_values(meme))
+                    || self.matcher.matches_values(tag_values(tags))
             }
             Field::Name => self
                 .matcher
@@ -263,6 +266,7 @@ impl SearchTerm {
             Field::Text => self.matcher.matches_values(text_values(meme)),
             Field::Type => self.matcher.matches_values(type_values(meme)),
             Field::Content => self.matcher.matches_values(content_values(meme)),
+            Field::Tag => self.matcher.matches_values(tag_values(tags)),
         }
     }
 }
@@ -287,6 +291,18 @@ fn content_values(meme: &Meme) -> impl Iterator<Item = &str> {
         MemeContent::Image(_) => "image",
         MemeContent::Motion(_) => "motion",
         MemeContent::Text(text) => text.text.as_str(),
+    })
+}
+
+fn tag_values(tags: &[Tag]) -> impl Iterator<Item = &str> {
+    tags.iter().flat_map(|tag| {
+        let (key, value) = tag
+            .name
+            .split_once(':')
+            .map(|(key, value)| (key.trim(), value.trim()))
+            .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+            .unwrap_or(("mixed", tag.name.as_str()));
+        [tag.name.as_str(), key, value]
     })
 }
 
@@ -516,7 +532,7 @@ mod tests {
 
     fn matches(query: &str, meme: &Meme, pack_name: Option<&str>) -> bool {
         match SearchExpression::parse(query) {
-            Ok(Some(expression)) => expression.matches(meme, pack_name),
+            Ok(Some(expression)) => expression.matches(meme, pack_name, &[]),
             Ok(None) => panic!("non-empty query must produce a search expression"),
             Err(error) => panic!("query must parse: {error}"),
         }
