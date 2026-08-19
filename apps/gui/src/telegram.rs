@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Cursor,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -12,7 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops};
 use memelith_clip::{ClipModel, ExecutionPolicy};
 use memelith_core::{
     COLLECTOR_DUPLICATE_MAX_COSINE_DISTANCE, MemeDatabase, MotionFormat, NewMeme, NewMemeContent,
@@ -28,9 +26,7 @@ const TELEGRAM_API: &str = "https://api.telegram.org";
 const UPDATE_TIMEOUT_SECONDS: i64 = 2;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_SIMILAR_PER_PAGE: usize = 3;
-const PREVIEW_TILE_SIZE: u32 = 480;
-const PREVIEW_GUTTER: u32 = 16;
+const MAX_SIMILAR_PER_PAGE: usize = 9;
 const STICKER_AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const TELEGRAM_STICKER_LINK_PREFIX: &str = "https://t.me/addstickers/";
 
@@ -208,7 +204,8 @@ struct BotState {
 struct PendingOperation {
     id: Uuid,
     chat_id: i64,
-    message_id: i64,
+    confirmation_message_id: i64,
+    media_message_ids: Vec<i64>,
     user_id: i64,
     source_path: PathBuf,
     preview_path: Option<PathBuf>,
@@ -328,54 +325,56 @@ impl TelegramApi {
         chat_id: i64,
         text: &str,
         markup: &InlineKeyboardMarkup,
+        reply_to_message_id: Option<i64>,
     ) -> Result<Message, TelegramError> {
-        self.call(
-            "sendMessage",
-            json!({"chat_id": chat_id, "text": text, "reply_markup": markup}),
-        )
+        let parameters = match reply_to_message_id {
+            Some(message_id) => json!({
+                "chat_id": chat_id,
+                "text": text,
+                "reply_markup": markup,
+                "reply_parameters": {"message_id": message_id},
+            }),
+            None => json!({"chat_id": chat_id, "text": text, "reply_markup": markup}),
+        };
+        self.call("sendMessage", parameters)
     }
 
-    fn send_preview(
+    fn send_preview_media(
         &self,
         chat_id: i64,
-        image: Vec<u8>,
+        paths: &[PathBuf],
         caption: &str,
-        markup: &InlineKeyboardMarkup,
-    ) -> Result<Message, TelegramError> {
-        let part = multipart::Part::bytes(image)
-            .file_name("memelith-preview.png")
-            .mime_str("image/png")?;
-        let form = multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .text("caption", caption.to_owned())
-            .text("reply_markup", serde_json::to_string(markup)?)
-            .part("photo", part);
-        self.multipart_call("sendPhoto", form)
-    }
+    ) -> Result<Vec<Message>, TelegramError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        if paths.len() == 1 {
+            let part = photo_part(&paths[0], 0)?;
+            let form = multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .text("caption", caption.to_owned())
+                .part("photo", part);
+            return self
+                .multipart_call("sendPhoto", form)
+                .map(|message| vec![message]);
+        }
 
-    fn edit_preview(
-        &self,
-        chat_id: i64,
-        message_id: i64,
-        image: Vec<u8>,
-        caption: &str,
-        markup: &InlineKeyboardMarkup,
-    ) -> Result<Message, TelegramError> {
-        let part = multipart::Part::bytes(image)
-            .file_name("memelith-preview.png")
-            .mime_str("image/png")?;
-        let media = json!({
-            "type": "photo",
-            "media": "attach://memelith-preview.png",
-            "caption": caption,
-        });
-        let form = multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .text("message_id", message_id.to_string())
-            .text("media", serde_json::to_string(&media)?)
-            .text("reply_markup", serde_json::to_string(markup)?)
-            .part("memelith-preview.png", part);
-        self.multipart_call("editMessageMedia", form)
+        let mut media = Vec::with_capacity(paths.len());
+        let mut form = multipart::Form::new().text("chat_id", chat_id.to_string());
+        for (index, path) in paths.iter().enumerate() {
+            let attachment = format!("memelith-preview-{index}");
+            let mut item = json!({
+                "type": "photo",
+                "media": format!("attach://{attachment}"),
+            });
+            if index == 0 {
+                item["caption"] = caption.into();
+            }
+            media.push(item);
+            form = form.part(attachment, photo_part(path, index)?);
+        }
+        form = form.text("media", serde_json::to_string(&media)?);
+        self.multipart_call("sendMediaGroup", form)
     }
 
     fn answer_callback(
@@ -1166,7 +1165,8 @@ fn handle_media(
     let pending = PendingOperation {
         id: operation_id,
         chat_id: message.chat.id,
-        message_id: 0,
+        confirmation_message_id: 0,
+        media_message_ids: Vec::new(),
         user_id: sender.id,
         source_path: source_file.path().to_owned(),
         preview_path: preview_file
@@ -1177,25 +1177,10 @@ fn handle_media(
         duplicate_count: duplicates.len(),
         page: 0,
     };
-    let markup = preview_markup(&pending);
-    let sent = if pending.preview_path().is_some() {
-        let preview = render_preview(&pending)?;
-        let caption = preview_caption(&pending);
-        state
-            .api
-            .send_preview(message.chat.id, preview, &caption, &markup)?
-    } else {
-        state.api.send_confirmation(
-            message.chat.id,
-            &format!(
-                "检测到 {} 张重复图片，但当前图片无法预览。是否仍然添加到 Collector？",
-                pending.duplicate_count
-            ),
-            &markup,
-        )?
-    };
     let mut pending = pending;
-    pending.message_id = sent.message_id;
+    let sent = send_pending_confirmation(&state, &pending)?;
+    pending.confirmation_message_id = sent.confirmation_message_id;
+    pending.media_message_ids = sent.media_message_ids;
     let pending_result = state
         .pending
         .lock()
@@ -1203,11 +1188,9 @@ fn handle_media(
     let mut operations = match pending_result {
         Ok(operations) => operations,
         Err(error) => {
-            if let Err(delete_error) =
-                delete_message_or_queue(&state, sent.chat.id, sent.message_id)
-            {
+            if let Err(delete_error) = delete_confirmation_messages(&state, &pending) {
                 eprintln!(
-                    "Memelith Telegram failed to clean up orphaned confirmation message: {delete_error}"
+                    "Memelith Telegram failed to clean up orphaned confirmation messages: {delete_error}"
                 );
             }
             return Err(error);
@@ -1261,7 +1244,7 @@ fn handle_callback(state: Arc<BotState>, callback: CallbackQuery) -> Result<(), 
     };
     if callback.from.id != pending_snapshot.user_id
         || callback_message.chat.id != pending_snapshot.chat_id
-        || callback_message.message_id != pending_snapshot.message_id
+        || callback_message.message_id != pending_snapshot.confirmation_message_id
     {
         log_api_result(
             "answer unauthorized callback query",
@@ -1277,30 +1260,44 @@ fn handle_callback(state: Arc<BotState>, callback: CallbackQuery) -> Result<(), 
     );
 
     if action == "page" {
-        let pending = {
+        let mut next = pending_snapshot.clone();
+        let page = page.ok_or(TelegramError::InvalidCallback)?;
+        next.page = page.min(page_count(next.similar_paths.len()).saturating_sub(1));
+        next.confirmation_message_id = 0;
+        next.media_message_ids.clear();
+        let sent = send_pending_confirmation(&state, &next)?;
+        next.confirmation_message_id = sent.confirmation_message_id;
+        next.media_message_ids = sent.media_message_ids;
+
+        let replaced = match (|| {
             let mut operations = state.pending.lock().map_err(|_| {
                 TelegramError::Api("pending operation lock was poisoned".to_owned())
             })?;
-            let operation = operations
-                .get_mut(&operation_id)
-                .ok_or(TelegramError::InvalidCallback)?;
-            if operation.preview_path().is_none() {
-                return Err(TelegramError::InvalidCallback);
+            let Some(operation) = operations.get_mut(&operation_id) else {
+                return Ok(false);
+            };
+            if operation.confirmation_message_id != pending_snapshot.confirmation_message_id {
+                Ok(false)
+            } else {
+                *operation = next.clone();
+                Ok(true)
             }
-            let page = page.ok_or(TelegramError::InvalidCallback)?;
-            operation.page = page.min(page_count(operation.similar_paths.len()).saturating_sub(1));
-            operation.clone()
+        })() {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                if let Err(delete_error) = delete_confirmation_messages(&state, &next) {
+                    eprintln!(
+                        "Memelith Telegram failed to clean up replacement confirmation: {delete_error}"
+                    );
+                }
+                return Err(error);
+            }
         };
-        let preview = render_preview(&pending)?;
-        let caption = preview_caption(&pending);
-        let markup = preview_markup(&pending);
-        state.api.edit_preview(
-            pending.chat_id,
-            pending.message_id,
-            preview,
-            &caption,
-            &markup,
-        )?;
+        if !replaced {
+            delete_confirmation_messages(&state, &next)?;
+            return Err(TelegramError::InvalidCallback);
+        }
+        delete_confirmation_messages(&state, &pending_snapshot)?;
         return Ok(());
     }
 
@@ -1344,7 +1341,7 @@ fn handle_callback(state: Arc<BotState>, callback: CallbackQuery) -> Result<(), 
     if let Some(preview_path) = &pending.preview_path {
         remove_temp_file(preview_path);
     }
-    delete_message_or_queue(&state, pending.chat_id, pending.message_id)?;
+    delete_confirmation_messages(&state, &pending)?;
     Ok(())
 }
 
@@ -1391,32 +1388,47 @@ fn collect_incoming_media(
     }
 }
 
-fn render_preview(operation: &PendingOperation) -> Result<Vec<u8>, TelegramError> {
-    let paths = preview_paths(operation);
-    let mut canvas = RgbaImage::from_pixel(
-        PREVIEW_TILE_SIZE * 2 + PREVIEW_GUTTER * 3,
-        PREVIEW_TILE_SIZE * 2 + PREVIEW_GUTTER * 3,
-        Rgba([245, 245, 247, 255]),
-    );
-    for (index, path) in paths.iter().enumerate() {
-        let image = image::open(path)?;
-        let thumbnail = image.thumbnail(PREVIEW_TILE_SIZE, PREVIEW_TILE_SIZE);
-        let x = PREVIEW_GUTTER
-            + (index as u32 % 2) * (PREVIEW_TILE_SIZE + PREVIEW_GUTTER)
-            + (PREVIEW_TILE_SIZE - thumbnail.width()) / 2;
-        let y = PREVIEW_GUTTER
-            + (index as u32 / 2) * (PREVIEW_TILE_SIZE + PREVIEW_GUTTER)
-            + (PREVIEW_TILE_SIZE - thumbnail.height()) / 2;
-        imageops::overlay(
-            &mut canvas,
-            &thumbnail.to_rgba8(),
-            i64::from(x),
-            i64::from(y),
-        );
-    }
-    let mut output = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(canvas).write_to(&mut output, ImageFormat::Png)?;
-    Ok(output.into_inner())
+struct SentPendingConfirmation {
+    confirmation_message_id: i64,
+    media_message_ids: Vec<i64>,
+}
+
+fn send_pending_confirmation(
+    state: &BotState,
+    operation: &PendingOperation,
+) -> Result<SentPendingConfirmation, TelegramError> {
+    let media_messages = state.api.send_preview_media(
+        operation.chat_id,
+        &preview_paths(operation),
+        &preview_caption(operation),
+    )?;
+    let media_message_ids = media_messages
+        .iter()
+        .map(|message| message.message_id)
+        .collect::<Vec<_>>();
+    let reply_to_message_id = media_message_ids.first().copied();
+    let confirmation = match state.api.send_confirmation(
+        operation.chat_id,
+        &confirmation_text(operation),
+        &preview_markup(operation),
+        reply_to_message_id,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            if let Err(delete_error) =
+                delete_messages_or_queue(state, operation.chat_id, &media_message_ids)
+            {
+                eprintln!(
+                    "Memelith Telegram failed to clean up confirmation media: {delete_error}"
+                );
+            }
+            return Err(error);
+        }
+    };
+    Ok(SentPendingConfirmation {
+        confirmation_message_id: confirmation.message_id,
+        media_message_ids,
+    })
 }
 
 fn preview_paths(operation: &PendingOperation) -> Vec<PathBuf> {
@@ -1435,6 +1447,16 @@ fn page_count(similar_count: usize) -> usize {
 }
 
 fn preview_caption(operation: &PendingOperation) -> String {
+    let page = operation.page + 1;
+    let pages = page_count(operation.similar_paths.len());
+    if operation.preview_path().is_some() {
+        format!("第 1 张为待添加内容，其余为相似内容（第 {page} / {pages} 页）。")
+    } else {
+        format!("当前内容无法预览，以下为检测到的相似内容（第 {page} / {pages} 页）。")
+    }
+}
+
+fn confirmation_text(operation: &PendingOperation) -> String {
     format!(
         "检测到 {} 张相似图片。第 {} / {} 页，请选择是否仍然添加到 Collector。",
         operation.duplicate_count,
@@ -1446,7 +1468,7 @@ fn preview_caption(operation: &PendingOperation) -> String {
 fn preview_markup(operation: &PendingOperation) -> InlineKeyboardMarkup {
     let pages = page_count(operation.similar_paths.len());
     let mut rows = Vec::new();
-    if operation.preview_path().is_some() && pages > 1 {
+    if pages > 1 {
         let mut navigation = Vec::new();
         if operation.page > 0 {
             navigation.push(InlineKeyboardButton {
@@ -1490,6 +1512,36 @@ fn log_api_result<T>(operation: &str, result: Result<T, TelegramError>) {
     if let Err(error) = result {
         eprintln!("Memelith Telegram failed to {operation}: {error}");
     }
+}
+
+fn photo_part(path: &Path, index: usize) -> Result<multipart::Part, TelegramError> {
+    let bytes = fs::read(path)?;
+    let format = image::guess_format(&bytes)?;
+    let extension = format.extensions_str().first().copied().unwrap_or("image");
+    Ok(multipart::Part::bytes(bytes)
+        .file_name(format!("memelith-preview-{index}.{extension}"))
+        .mime_str(format.to_mime_type())?)
+}
+
+fn delete_confirmation_messages(
+    state: &BotState,
+    operation: &PendingOperation,
+) -> Result<(), TelegramError> {
+    if operation.confirmation_message_id != 0 {
+        delete_message_or_queue(state, operation.chat_id, operation.confirmation_message_id)?;
+    }
+    delete_messages_or_queue(state, operation.chat_id, &operation.media_message_ids)
+}
+
+fn delete_messages_or_queue(
+    state: &BotState,
+    chat_id: i64,
+    message_ids: &[i64],
+) -> Result<(), TelegramError> {
+    for &message_id in message_ids {
+        delete_message_or_queue(state, chat_id, message_id)?;
+    }
+    Ok(())
 }
 
 fn delete_message_or_queue(
