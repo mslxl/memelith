@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 const TELEGRAM_API: &str = "https://api.telegram.org";
 const UPDATE_TIMEOUT_SECONDS: i64 = 2;
-const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SIMILAR_PER_PAGE: usize = 3;
 const PREVIEW_TILE_SIZE: u32 = 480;
 const PREVIEW_GUTTER: u32 = 16;
@@ -84,6 +85,7 @@ enum TelegramError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TelegramBotStatus {
     Starting,
+    LoadingModel,
     Running,
     StickerPackSyncStarted {
         pack_id: Uuid,
@@ -247,7 +249,10 @@ impl TelegramApi {
         if token.is_empty() {
             return Err(TelegramError::Api("Telegram Bot token is empty".to_owned()));
         }
-        let client = Client::builder().timeout(HTTP_TIMEOUT).build()?;
+        let client = Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_TIMEOUT)
+            .build()?;
         Ok(Self {
             client,
             base_url: format!("{TELEGRAM_API}/bot{token}"),
@@ -426,6 +431,7 @@ fn run_bot(
     if stop_receiver.try_recv().is_ok() {
         return Ok(());
     }
+    let _ = status.send(TelegramBotStatus::LoadingModel);
     let model = ClipModel::load(model_directory, ExecutionPolicy::Auto)
         .map_err(|error| TelegramError::Api(format!("failed to load CLIP model: {error}")))?;
     if stop_receiver.try_recv().is_ok() {

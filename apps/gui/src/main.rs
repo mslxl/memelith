@@ -417,6 +417,7 @@ enum Notice {
 enum TelegramRuntimeState {
     Stopped,
     Starting,
+    LoadingModel,
     Running,
     Stopping,
     Failed(String),
@@ -895,9 +896,21 @@ impl MemelithView {
                     self.telegram_runtime_state = TelegramRuntimeState::Starting;
                 }
             }
+            telegram::TelegramBotStatus::LoadingModel => {
+                if self.telegram_runtime_state != TelegramRuntimeState::Stopping {
+                    self.telegram_runtime_state = TelegramRuntimeState::LoadingModel;
+                }
+            }
             telegram::TelegramBotStatus::Running => {
                 if self.telegram_runtime_state != TelegramRuntimeState::Stopping {
                     self.telegram_runtime_state = TelegramRuntimeState::Running;
+                }
+                if matches!(
+                    self.notice.as_ref(),
+                    Some(Notice::Success(message))
+                        if message == "Telegram 设置已保存，Bot 正在启动"
+                ) {
+                    self.notice = Some(Notice::Success("Telegram Bot 已启动".to_owned()));
                 }
             }
             telegram::TelegramBotStatus::StickerPackSyncStarted { pack_id } => {
@@ -971,7 +984,9 @@ impl MemelithView {
             return;
         }
         match self.telegram_runtime_state {
-            TelegramRuntimeState::Starting | TelegramRuntimeState::Running => {
+            TelegramRuntimeState::Starting
+            | TelegramRuntimeState::LoadingModel
+            | TelegramRuntimeState::Running => {
                 self.telegram_runtime.take();
                 self.telegram_sticker_syncing.clear();
                 let message = "Bot 线程意外退出".to_owned();
@@ -1002,6 +1017,7 @@ impl MemelithView {
             }
             TelegramRuntimeState::Stopped => "已停止".to_owned(),
             TelegramRuntimeState::Starting => "正在启动…".to_owned(),
+            TelegramRuntimeState::LoadingModel => "正在加载模型…".to_owned(),
             TelegramRuntimeState::Running => "正在运行".to_owned(),
             TelegramRuntimeState::Stopping => "正在停止…".to_owned(),
             TelegramRuntimeState::Failed(message) => format!("启动失败：{message}"),
@@ -1052,7 +1068,7 @@ impl MemelithView {
                         self.start_telegram_bot(cx);
                     }
                     match self.telegram_runtime_state {
-                        TelegramRuntimeState::Starting => {
+                        TelegramRuntimeState::Starting | TelegramRuntimeState::LoadingModel => {
                             self.notice = Some(Notice::Success(
                                 "Telegram 设置已保存，Bot 正在启动".to_owned(),
                             ));
