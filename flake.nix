@@ -40,6 +40,7 @@
           pkgs.cargo-bundle
           pkgs.macdylibbundler
           pkgs.cargo-tauri
+          pkgs.ffmpeg
         ];
       in
       {
@@ -49,6 +50,7 @@
 
           # Specify the rust-src path (many editors rely on this)
           RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
+          GNU_LIBICONV_PATH = "${pkgs.libiconvReal}/lib/libiconv.2.dylib";
         };
       }
     );

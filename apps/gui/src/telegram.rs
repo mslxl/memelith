@@ -211,6 +211,7 @@ struct PendingOperation {
     source_path: PathBuf,
     preview_path: Option<PathBuf>,
     media: IncomingMedia,
+    collector_item_id: Uuid,
     similar_paths: Vec<PathBuf>,
     duplicate_count: usize,
     page: usize,
@@ -538,17 +539,32 @@ fn shutdown_state(state: &Arc<BotState>) {
         }
     }
 
-    match state.pending.lock() {
-        Ok(mut pending) => {
-            for operation in pending.drain().map(|(_, operation)| operation) {
-                remove_temp_file(&operation.source_path);
-                if let Some(preview_path) = operation.preview_path {
-                    remove_temp_file(&preview_path);
+    let pending_operations = match state.pending.lock() {
+        Ok(mut pending) => pending.drain().map(|(_, operation)| operation).collect(),
+        Err(_) => {
+            eprintln!("Memelith Telegram failed to acquire pending lock during shutdown");
+            Vec::new()
+        }
+    };
+    for operation in pending_operations {
+        if operation.collector_item_id != Uuid::nil() {
+            match state.database.lock() {
+                Ok(mut database) => {
+                    if let Err(error) = database.delete_collector_item(operation.collector_item_id)
+                    {
+                        eprintln!(
+                            "Memelith Telegram failed to clean up reserved Collector item during shutdown: {error}"
+                        );
+                    }
+                }
+                Err(_) => {
+                    eprintln!("Memelith Telegram failed to acquire database lock during shutdown")
                 }
             }
         }
-        Err(_) => {
-            eprintln!("Memelith Telegram failed to acquire pending lock during shutdown");
+        remove_temp_file(&operation.source_path);
+        if let Some(preview_path) = operation.preview_path {
+            remove_temp_file(&preview_path);
         }
     }
 }
@@ -1175,12 +1191,54 @@ fn handle_media(
             .as_ref()
             .map(|preview_file| preview_file.path().to_path_buf()),
         media,
+        collector_item_id: Uuid::nil(),
         similar_paths,
         duplicate_count: duplicates.len(),
         page: 0,
     };
     let mut pending = pending;
-    let sent = send_pending_confirmation(&state, &pending)?;
+    // Reserve the Collector row before sending Telegram's confirmation so later
+    // uploads cannot acquire a newer rowid and overtake this operation.
+    let reservation_result = match state.database.lock() {
+        Ok(mut database) => collect_incoming_media(
+            &mut database,
+            &pending.media,
+            &pending.source_path,
+            pending.preview_path.as_deref(),
+        ),
+        Err(_) => Err(memelith_core::Error::InvalidDatabase(
+            "database lock was poisoned".to_owned(),
+        )),
+    };
+    let collector_item_id = match reservation_result {
+        Ok(item) => item.id,
+        Err(error) => {
+            delete_confirmation_messages(&state, &pending)?;
+            remove_temp_file(&pending.source_path);
+            if let Some(preview_path) = &pending.preview_path {
+                remove_temp_file(preview_path);
+            }
+            return Err(error.into());
+        }
+    };
+    pending.collector_item_id = collector_item_id;
+    let sent = match send_pending_confirmation(&state, &pending) {
+        Ok(sent) => sent,
+        Err(error) => {
+            if let Ok(mut database) = state.database.lock()
+                && let Err(delete_error) = database.delete_collector_item(collector_item_id)
+            {
+                eprintln!(
+                    "Memelith Telegram failed to clean up reserved Collector item: {delete_error}"
+                );
+            }
+            remove_temp_file(&pending.source_path);
+            if let Some(preview_path) = &pending.preview_path {
+                remove_temp_file(preview_path);
+            }
+            return Err(error);
+        }
+    };
     pending.confirmation_message_id = sent.confirmation_message_id;
     pending.media_message_ids = sent.media_message_ids;
     let pending_result = state
@@ -1193,6 +1251,13 @@ fn handle_media(
             if let Err(delete_error) = delete_confirmation_messages(&state, &pending) {
                 eprintln!(
                     "Memelith Telegram failed to clean up orphaned confirmation messages: {delete_error}"
+                );
+            }
+            if let Ok(mut database) = state.database.lock()
+                && let Err(delete_error) = database.delete_collector_item(collector_item_id)
+            {
+                eprintln!(
+                    "Memelith Telegram failed to clean up reserved Collector item: {delete_error}"
                 );
             }
             return Err(error);
@@ -1310,35 +1375,36 @@ fn handle_callback(state: Arc<BotState>, callback: CallbackQuery) -> Result<(), 
         .remove(&operation_id)
         .ok_or(TelegramError::InvalidCallback)?;
     if action == "keep" {
-        let collect_result = match state.database.lock() {
-            Ok(mut database) => collect_incoming_media(
-                &mut database,
-                &pending.media,
-                &pending.source_path,
-                pending.preview_path.as_deref(),
-            ),
+        let _ = state.status.send(TelegramBotStatus::CollectorUpdated);
+    } else if action != "discard" {
+        return Err(TelegramError::InvalidCallback);
+    } else {
+        let delete_result = match state.database.lock() {
+            Ok(mut database) => database.delete_collector_item(pending.collector_item_id),
             Err(_) => Err(memelith_core::Error::InvalidDatabase(
                 "database lock was poisoned".to_owned(),
             )),
         };
-        if let Err(error) = collect_result {
-            let pending_id = pending.id;
-            state
+        if let Err(error) = delete_result {
+            let restore_result = state
                 .pending
                 .lock()
-                .map_err(|_| TelegramError::Api("pending operation lock was poisoned".to_owned()))?
-                .insert(pending_id, pending.clone());
+                .map(|mut operations| operations.insert(operation_id, pending.clone()))
+                .map_err(|_| TelegramError::Api("pending operation lock was poisoned".to_owned()));
+            if let Err(restore_error) = restore_result {
+                eprintln!(
+                    "Memelith Telegram failed to restore pending operation after discard failure: {restore_error}"
+                );
+            }
             log_api_result(
-                "send Collector failure message",
+                "send Collector discard failure message",
                 state
                     .api
-                    .send_message(pending.chat_id, &format!("仍然添加失败：{error}")),
+                    .send_message(pending.chat_id, &format!("放弃添加失败：{error}")),
             );
             return Err(error.into());
         }
         let _ = state.status.send(TelegramBotStatus::CollectorUpdated);
-    } else if action != "discard" {
-        return Err(TelegramError::InvalidCallback);
     }
     remove_temp_file(&pending.source_path);
     if let Some(preview_path) = &pending.preview_path {

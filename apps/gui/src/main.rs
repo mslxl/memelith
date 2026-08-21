@@ -6,16 +6,18 @@ mod telegram;
 
 use std::{
     collections::{HashMap, HashSet},
+    io::Cursor,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, Mutex, OnceLock, mpsc},
     time::Duration,
 };
 
 use gpui::{
-    AnyElement, App, Application, Bounds, BoxShadow, Context, Corner, Div, ElementId, Entity,
-    Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions,
-    Pixels, Point, PromptButton, PromptLevel, SharedString, Stateful, Window,
+    AnyElement, App, Application, Bounds, BoxShadow, Context, Corner, DevicePixels, Div, Element,
+    ElementId, Entity, Focusable, FontWeight, GlobalElementId, InspectorElementId, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point,
+    PromptButton, PromptLevel, SharedString, Stateful, Style, StyleRefinement, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowOptions, actions, anchored,
     deferred, div, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative,
     rgb, rgba, size,
@@ -38,6 +40,51 @@ const INBOX_NAME: &str = "Inbox";
 const DUPLICATE_IMAGE_MAX_COSINE_DISTANCE: f32 = 0.05;
 const MAX_TAG_SUGGESTIONS: usize = 6;
 const WAIFU_SENSOR_DATABASE_FILENAME: &str = "waifu-sensor.sqlite3";
+
+static BLURRED_PREVIEW_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<gpui::RenderImage>>>> =
+    OnceLock::new();
+static VIDEO_PLAYBACK_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<VideoPlayback>>>> =
+    OnceLock::new();
+
+#[cfg(target_os = "macos")]
+struct VideoFrame {
+    width: usize,
+    height: usize,
+    pixel_buffer: core_video::pixel_buffer::CVPixelBuffer,
+}
+
+// CoreVideo pixel buffers are reference-counted and are designed to move
+// between capture/decode and render threads. The mutex around the current
+// frame synchronizes replacement while GPUI retains the cloned buffer.
+#[cfg(target_os = "macos")]
+unsafe impl Send for VideoFrame {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for VideoFrame {}
+
+struct VideoPlayback {
+    #[cfg(target_os = "macos")]
+    frame: Mutex<Option<Arc<VideoFrame>>>,
+}
+
+impl VideoPlayback {
+    fn new(path: PathBuf) -> Arc<Self> {
+        let playback = Arc::new(Self {
+            #[cfg(target_os = "macos")]
+            frame: Mutex::new(None),
+        });
+        let worker = Arc::clone(&playback);
+        std::thread::Builder::new()
+            .name("memelith-video".to_owned())
+            .spawn(move || decode_video(path, worker))
+            .ok();
+        playback
+    }
+
+    #[cfg(target_os = "macos")]
+    fn current_frame(&self) -> Option<Arc<VideoFrame>> {
+        self.frame.lock().ok()?.clone()
+    }
+}
 
 actions!(
     memelith,
@@ -369,6 +416,7 @@ enum DraftContent {
     },
     Motion {
         collector_item_id: Uuid,
+        media_path: PathBuf,
         preview_path: Option<PathBuf>,
     },
     Text {
@@ -1511,9 +1559,13 @@ impl MemelithView {
                 })
             }
             CollectorContent::Motion {
+                relative_path,
                 preview_relative_path,
                 ..
             } => {
+                let media_path =
+                    MemeDatabase::resolve_media_path_from_root(storage_root, relative_path)
+                        .map_err(|error| format!("无法打开 Collector 动图：{error}"))?;
                 let preview_path = preview_relative_path
                     .as_ref()
                     .map(|relative_path| {
@@ -1523,6 +1575,7 @@ impl MemelithView {
                     .transpose()?;
                 Ok(DraftContent::Motion {
                     collector_item_id: item.id,
+                    media_path,
                     preview_path,
                 })
             }
@@ -2911,13 +2964,7 @@ impl MemelithView {
                 .and_then(|root| {
                     MemeDatabase::resolve_media_path_from_root(root, relative_path).ok()
                 })
-                .map(|path| {
-                    div()
-                        .size_full()
-                        .bg(rgba(0x3c3c4314))
-                        .child(img(path).size_full().object_fit(ObjectFit::Cover))
-                        .into_any_element()
-                })
+                .map(render_image_preview)
                 .unwrap_or_else(|| {
                     div()
                         .size_full()
@@ -2930,21 +2977,19 @@ impl MemelithView {
                         .into_any_element()
                 }),
             CollectorContent::Motion {
+                relative_path,
                 preview_relative_path,
                 ..
-            } => preview_relative_path
+            } => self
+                .storage_root
                 .as_ref()
-                .and_then(|relative_path| {
-                    self.storage_root.as_ref().and_then(|root| {
-                        MemeDatabase::resolve_media_path_from_root(root, relative_path).ok()
-                    })
-                })
-                .map(|path| {
-                    div()
-                        .size_full()
-                        .bg(rgba(0x3c3c4314))
-                        .child(img(path).size_full().object_fit(ObjectFit::Cover))
-                        .into_any_element()
+                .and_then(|root| {
+                    let media_path =
+                        MemeDatabase::resolve_media_path_from_root(root, relative_path).ok()?;
+                    let preview_path = preview_relative_path.as_ref().and_then(|path| {
+                        MemeDatabase::resolve_media_path_from_root(root, path).ok()
+                    });
+                    Some(render_motion_preview(media_path, preview_path))
                 })
                 .unwrap_or_else(|| {
                     div()
@@ -3452,7 +3497,7 @@ impl MemelithView {
             .iter()
             .filter(|content| content.is_image())
             .count();
-        let (draft_index, path, similar_images) = self
+        let (draft_index, path, preview_path, similar_images) = self
             .draft_contents
             .iter()
             .enumerate()
@@ -3461,10 +3506,17 @@ impl MemelithView {
                     path,
                     similar_images,
                     ..
-                } => Some((index, Some(path.as_path()), similar_images.as_slice())),
-                DraftContent::Motion { preview_path, .. } => {
-                    Some((index, preview_path.as_deref(), &[][..]))
-                }
+                } => Some((index, Some(path.as_path()), None, similar_images.as_slice())),
+                DraftContent::Motion {
+                    media_path,
+                    preview_path,
+                    ..
+                } => Some((
+                    index,
+                    Some(media_path.as_path()),
+                    preview_path.as_deref(),
+                    &[][..],
+                )),
                 DraftContent::Text { .. } => None,
             })
             .nth(self.active_draft_image)
@@ -3478,10 +3530,15 @@ impl MemelithView {
             },
         );
         let preview = match path {
-            Some(path) => img(path.to_path_buf())
-                .size_full()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element(),
+            Some(path) if preview_path.is_some() || is_image_path(path) => {
+                render_motion_or_image_preview(
+                    path.to_path_buf(),
+                    preview_path.map(Path::to_path_buf),
+                )
+            }
+            Some(path) => {
+                render_motion_preview(path.to_path_buf(), preview_path.map(Path::to_path_buf))
+            }
             None => div()
                 .size_full()
                 .flex()
@@ -3763,38 +3820,29 @@ impl MemelithView {
                 MemeContent::Image(image) => self.storage_root.as_ref().and_then(|storage_root| {
                     MemeDatabase::resolve_media_path_from_root(storage_root, &image.relative_path)
                         .ok()
-                        .map(|path| {
+                        .map(render_image_preview)
+                }),
+                MemeContent::Motion(motion) => {
+                    self.storage_root.as_ref().and_then(|storage_root| {
+                        let media_path = MemeDatabase::resolve_media_path_from_root(
+                            storage_root,
+                            &motion.relative_path,
+                        )
+                        .ok()?;
+                        let preview_path = motion.preview_relative_path.as_ref().and_then(|path| {
+                            MemeDatabase::resolve_media_path_from_root(storage_root, path).ok()
+                        });
+                        // Unlike image previews, the video surface is intrinsically sized to
+                        // its parent. The all-Meme card has no other height constraint, so give
+                        // it the same fixed preview viewport as still images.
+                        Some(
                             div()
                                 .h(px(160.))
                                 .w_full()
-                                .overflow_hidden()
-                                .bg(rgba(0x3c3c4314))
-                                .child(img(path).size_full().object_fit(ObjectFit::Cover))
-                                .into_any_element()
-                        })
-                }),
-                MemeContent::Motion(motion) => {
-                    motion
-                        .preview_relative_path
-                        .as_ref()
-                        .and_then(|relative_path| {
-                            self.storage_root.as_ref().and_then(|storage_root| {
-                                MemeDatabase::resolve_media_path_from_root(
-                                    storage_root,
-                                    relative_path,
-                                )
-                                .ok()
-                                .map(|path| {
-                                    div()
-                                        .h(px(160.))
-                                        .w_full()
-                                        .overflow_hidden()
-                                        .bg(rgba(0x3c3c4314))
-                                        .child(img(path).size_full().object_fit(ObjectFit::Cover))
-                                        .into_any_element()
-                                })
-                            })
-                        })
+                                .child(render_motion_preview(media_path, preview_path))
+                                .into_any_element(),
+                        )
+                    })
                 }
                 MemeContent::Text(_) => None,
             })
@@ -4475,6 +4523,452 @@ fn render_notice(notice: &Notice) -> AnyElement {
         .child(div().size(px(8.)).flex_none().rounded_full().bg(rgb(dot)))
         .child(div().text_sm().text_color(rgb(INK)).child(message.clone()))
         .into_any_element()
+}
+
+fn render_image_preview(path: PathBuf) -> AnyElement {
+    div()
+        .h(px(160.))
+        .w_full()
+        .child(render_image_preview_layers(path))
+        .into_any_element()
+}
+
+fn render_image_preview_layers(path: PathBuf) -> AnyElement {
+    let background_path = path.clone();
+    let image_id = SharedString::from(format!("image-preview-{}", path.display()));
+    div()
+        .relative()
+        .size_full()
+        .flex_none()
+        .overflow_hidden()
+        .bg(rgba(0x3c3c4314))
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .size_full()
+                .child(blurred_preview_image(background_path))
+                .child(div().absolute().inset_0().bg(rgba(0x00000038))),
+        )
+        .child(
+            img(path)
+                .id(image_id)
+                .absolute()
+                .inset_0()
+                .size_full()
+                .object_fit(ObjectFit::Contain),
+        )
+        .into_any_element()
+}
+
+fn blurred_preview_image(path: PathBuf) -> impl IntoElement {
+    img(move |window: &mut Window, cx: &mut App| {
+        let cache = BLURRED_PREVIEW_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(image) = cache.lock().ok()?.get(&path).cloned() {
+            return Some(Ok(image));
+        }
+
+        let resource = gpui::Resource::Path(path.clone().into());
+        let original = window.use_asset::<gpui::ImgResourceLoader>(&resource, cx)?;
+        let Ok(original) = original else {
+            return None;
+        };
+        let size = original.size(0);
+        let bytes = original.as_bytes(0)?.to_vec();
+        let width = u32::from(size.width);
+        let height = u32::from(size.height);
+        let mut rgba = image::RgbaImage::from_raw(width, height, bytes)?;
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+
+        // Blur a reduced copy so large originals do not make the UI pay for a
+        // full-resolution convolution merely to fill the preview letterbox.
+        let reduced = image::imageops::thumbnail(&rgba, 320, 220);
+        let blurred = image::imageops::blur(&reduced, 18.0);
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(blurred)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .ok()?;
+        let image = Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            encoded.into_inner(),
+        ));
+        let rendered = image.use_render_image(window, cx)?;
+        cache.lock().ok()?.insert(path.clone(), rendered.clone());
+        Some(Ok(rendered))
+    })
+    .size_full()
+    .object_fit(ObjectFit::Cover)
+    .opacity(0.72)
+}
+
+fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff")
+    )
+}
+
+fn render_motion_or_image_preview(path: PathBuf, preview_path: Option<PathBuf>) -> AnyElement {
+    if is_image_path(&path) {
+        render_image_preview_layers(path)
+    } else {
+        render_motion_preview(path, preview_path)
+    }
+}
+
+fn render_motion_preview(path: PathBuf, preview_path: Option<PathBuf>) -> AnyElement {
+    let background = preview_path.clone().map(|preview| {
+        div()
+            .absolute()
+            .inset_0()
+            .size_full()
+            .child(blurred_preview_image(preview))
+            .child(div().absolute().inset_0().bg(rgba(0x00000038)))
+    });
+
+    #[cfg(target_os = "macos")]
+    let foreground = video_surface(path);
+    #[cfg(not(target_os = "macos"))]
+    let foreground = preview_path
+        .clone()
+        .map(|preview| img(preview).size_full().object_fit(ObjectFit::Contain))
+        .unwrap_or_else(|| img(path).size_full().object_fit(ObjectFit::Contain));
+
+    div()
+        .relative()
+        .size_full()
+        .flex_none()
+        .overflow_hidden()
+        .bg(rgba(0x3c3c4314))
+        .when_some(background, |element, background| element.child(background))
+        .child(foreground)
+        .into_any_element()
+}
+
+fn video_playback(path: PathBuf) -> Arc<VideoPlayback> {
+    let cache = VIDEO_PLAYBACK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut cache) = cache.lock() {
+        Arc::clone(
+            cache
+                .entry(path.clone())
+                .or_insert_with(|| VideoPlayback::new(path)),
+        )
+    } else {
+        VideoPlayback::new(path)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn video_surface(path: PathBuf) -> impl IntoElement {
+    VideoSurface::new(video_playback(path))
+        .size_full()
+        .object_fit(ObjectFit::Contain)
+}
+
+#[cfg(target_os = "macos")]
+struct VideoSurface {
+    playback: Arc<VideoPlayback>,
+    object_fit: ObjectFit,
+    style: StyleRefinement,
+}
+
+#[cfg(target_os = "macos")]
+impl VideoSurface {
+    fn new(playback: Arc<VideoPlayback>) -> Self {
+        Self {
+            playback,
+            object_fit: ObjectFit::Contain,
+            style: StyleRefinement::default(),
+        }
+    }
+
+    fn object_fit(mut self, object_fit: ObjectFit) -> Self {
+        self.object_fit = object_fit;
+        self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Styled for VideoSurface {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Element for VideoSurface {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.refine(&self.style);
+        window.request_animation_frame();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        let Some(frame) = self.playback.current_frame() else {
+            return;
+        };
+        let image_size = size(
+            DevicePixels::from(frame.width as u32),
+            DevicePixels::from(frame.height as u32),
+        );
+        let image_bounds = self.object_fit.get_bounds(bounds, image_size);
+        window.paint_surface(image_bounds, frame.pixel_buffer.clone());
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl gpui::IntoElement for VideoSurface {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl VideoFrame {
+    fn from_planes(width: usize, height: usize, y: &[u8], uv: &[u8]) -> Option<Self> {
+        use core_foundation::{
+            base::{CFType, TCFType},
+            boolean::CFBoolean,
+            dictionary::CFDictionary,
+            string::CFString,
+        };
+        use core_video::pixel_buffer::{
+            CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        };
+
+        let iosurface_properties = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[]);
+        let options = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[
+            (
+                CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
+                iosurface_properties.as_CFType(),
+            ),
+            (
+                CFString::from(CVPixelBufferKeys::MetalCompatibility),
+                CFBoolean::true_value().as_CFType(),
+            ),
+        ]);
+        let buffer = CVPixelBuffer::new(
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            width,
+            height,
+            Some(&options),
+        )
+        .ok()?;
+        if buffer.lock_base_address(0) != 0 {
+            return None;
+        }
+        unsafe {
+            let y_destination = buffer.get_base_address_of_plane(0).cast::<u8>();
+            let uv_destination = buffer.get_base_address_of_plane(1).cast::<u8>();
+            let y_stride = buffer.get_bytes_per_row_of_plane(0);
+            let uv_stride = buffer.get_bytes_per_row_of_plane(1);
+            for row in 0..height {
+                std::ptr::copy_nonoverlapping(
+                    y.as_ptr().add(row * width),
+                    y_destination.add(row * y_stride),
+                    width,
+                );
+            }
+            for row in 0..height / 2 {
+                std::ptr::copy_nonoverlapping(
+                    uv.as_ptr().add(row * width),
+                    uv_destination.add(row * uv_stride),
+                    width,
+                );
+            }
+        }
+        buffer.unlock_base_address(0);
+        Some(Self {
+            width,
+            height,
+            pixel_buffer: buffer,
+        })
+    }
+}
+
+fn decode_video(path: PathBuf, playback: Arc<VideoPlayback>) {
+    if let Err(error) = decode_video_loop(path.clone(), playback) {
+        eprintln!("video playback failed for {}: {error}", path.display());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn decode_video_loop(path: PathBuf, playback: Arc<VideoPlayback>) -> Result<(), String> {
+    use ffmpeg::software::scaling::{context::Context as ScalingContext, flag::Flags};
+    use ffmpeg::util::{format::pixel::Pixel, frame::video::Video};
+    use ffmpeg_next as ffmpeg;
+
+    ffmpeg::init().map_err(|error| format!("FFmpeg initialization failed: {error}"))?;
+    loop {
+        let mut input = ffmpeg::format::input(&path)
+            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        let stream = input
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .ok_or_else(|| format!("no video stream in {}", path.display()))?;
+        let stream_index = stream.index();
+        let parameters = stream.parameters();
+        let context = ffmpeg::codec::context::Context::from_parameters(parameters.clone())
+            .map_err(|error| format!("cannot create decoder: {error}"))?;
+        let mut decoder = if parameters.id() == ffmpeg::codec::Id::VP9 {
+            // Telegram WebM stickers commonly carry an alpha plane. The bundled
+            // libvpx decoder handles those streams more reliably than FFmpeg's
+            // native VP9 decoder, while still exposing a normal video frame to
+            // the scaler below.
+            if let Some(codec) = ffmpeg::codec::decoder::find_by_name("libvpx-vp9") {
+                context
+                    .decoder()
+                    .open_as(codec)
+                    .and_then(|opened| opened.video())
+            } else {
+                context.decoder().video()
+            }
+        } else {
+            context.decoder().video()
+        }
+        .map_err(|error| format!("cannot open decoder: {error}"))?;
+        let source_width = decoder.width().max(2);
+        let source_height = decoder.height().max(2);
+        let longest_edge = source_width.max(source_height);
+        let scale = (640.0 / longest_edge as f32).min(1.0);
+        let target_width = ((source_width as f32 * scale).round() as u32).max(2) & !1;
+        let target_height = ((source_height as f32 * scale).round() as u32).max(2) & !1;
+        if target_width == 0 || target_height == 0 {
+            return Err("video has invalid dimensions".to_owned());
+        }
+        // WebM stickers with alpha can change their decoded pixel format after
+        // the first packet (for example YUVA420P -> YUV420P). Keep the scaler
+        // tied to the actual frame format and recreate it when FFmpeg reports
+        // an input change.
+        let mut scaler: Option<ScalingContext> = None;
+        let mut scaler_source: Option<(Pixel, u32, u32)> = None;
+        let mut decoded = Video::empty();
+        let mut scaled = Video::empty();
+        let mut next_frame = std::time::Instant::now();
+        for (packet_stream, packet) in input.packets() {
+            if packet_stream.index() != stream_index {
+                continue;
+            }
+            decoder
+                .send_packet(&packet)
+                .map_err(|error| format!("decoder packet error: {error}"))?;
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let now = std::time::Instant::now();
+                if now < next_frame {
+                    std::thread::sleep(next_frame.duration_since(now));
+                }
+                let source = (decoded.format(), decoded.width(), decoded.height());
+                if scaler_source != Some(source) {
+                    scaler = Some(
+                        ScalingContext::get(
+                            source.0,
+                            source.1,
+                            source.2,
+                            Pixel::NV12,
+                            target_width,
+                            target_height,
+                            Flags::BILINEAR,
+                        )
+                        .map_err(|error| format!("cannot create video scaler: {error}"))?,
+                    );
+                    scaler_source = Some(source);
+                }
+                scaler
+                    .as_mut()
+                    .expect("video scaler is initialized for the decoded frame")
+                    .run(&decoded, &mut scaled)
+                    .map_err(|error| format!("video scaling error: {error}"))?;
+                let y_stride = scaled.stride(0);
+                let uv_stride = scaled.stride(1);
+                let y = copy_plane(
+                    scaled.data(0),
+                    y_stride,
+                    target_height as usize,
+                    target_width as usize,
+                );
+                let uv = copy_plane(
+                    scaled.data(1),
+                    uv_stride,
+                    target_height as usize / 2,
+                    target_width as usize,
+                );
+                if let Some(frame) =
+                    VideoFrame::from_planes(target_width as usize, target_height as usize, &y, &uv)
+                    && let Ok(mut current) = playback.frame.lock()
+                {
+                    *current = Some(Arc::new(frame));
+                }
+                next_frame = std::time::Instant::now() + Duration::from_millis(66);
+            }
+        }
+        decoder
+            .send_eof()
+            .map_err(|error| format!("decoder EOF error: {error}"))?;
+        while decoder.receive_frame(&mut decoded).is_ok() {}
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn decode_video_loop(_path: PathBuf, _playback: Arc<VideoPlayback>) -> Result<(), String> {
+    Err("video playback is only available on macOS".to_owned())
+}
+
+fn copy_plane(source: &[u8], stride: usize, height: usize, width: usize) -> Vec<u8> {
+    let mut result = vec![0; width * height];
+    for row in 0..height {
+        let source_start = row * stride;
+        let destination_start = row * width;
+        let available = source.len().saturating_sub(source_start).min(width);
+        result[destination_start..destination_start + available]
+            .copy_from_slice(&source[source_start..source_start + available]);
+    }
+    result
 }
 
 fn format_download_bytes(bytes: u64) -> String {

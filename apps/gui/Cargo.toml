@@ -24,6 +24,7 @@ osx_minimum_system_version = "14.0"
 
 [dependencies]
 dirs = "6.0.0"
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 gpui.workspace = true
 hex = "0.4.3"
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
@@ -40,6 +41,10 @@ unicode-normalization = "0.1.25"
 unicode-segmentation = "1.12.0"
 uuid = "1.19.0"
 waifu-sensor.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.0"
+core-video = { version = "0.4.3", features = ["metal"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
