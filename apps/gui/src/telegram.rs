@@ -26,13 +26,15 @@ const TELEGRAM_API: &str = "https://api.telegram.org";
 const UPDATE_TIMEOUT_SECONDS: i64 = 2;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_MAX_IDLE_CONNECTIONS_PER_HOST: usize = 4;
+const MAX_TELEGRAM_WORKERS: usize = 4;
 const MAX_SIMILAR_PER_PAGE: usize = 9;
 const STICKER_AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const TELEGRAM_STICKER_LINK_PREFIX: &str = "https://t.me/addstickers/";
 
 #[derive(Debug, Error)]
 enum TelegramError {
-    #[error("Telegram request failed")]
+    #[error("Telegram request failed: {0}")]
     Request(#[from] reqwest::Error),
 
     #[error("Telegram returned an error: {0}")]
@@ -251,6 +253,8 @@ impl TelegramApi {
         let client = Client::builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_TIMEOUT)
+            .pool_max_idle_per_host(HTTP_MAX_IDLE_CONNECTIONS_PER_HOST)
+            .pool_idle_timeout(HTTP_TIMEOUT)
             .build()?;
         Ok(Self {
             client,
@@ -454,7 +458,7 @@ fn run_bot(
 
     let mut offset = 0_i64;
     let mut next_auto_sync = Instant::now();
-    loop {
+    'poll: loop {
         if stop_receiver.try_recv().is_ok() {
             break;
         }
@@ -468,6 +472,9 @@ fn run_bot(
         match state.api.get_updates(offset) {
             Ok(updates) => {
                 for update in updates {
+                    if !wait_for_worker_capacity(&state, &stop_receiver) {
+                        break 'poll;
+                    }
                     offset = update.update_id.saturating_add(1);
                     let worker_state = Arc::clone(&state);
                     let worker = thread::Builder::new()
@@ -510,6 +517,26 @@ fn run_bot(
     Ok(())
 }
 
+fn wait_for_worker_capacity(state: &Arc<BotState>, stop_receiver: &mpsc::Receiver<()>) -> bool {
+    loop {
+        reap_finished_workers(state);
+        let at_capacity = match state.workers.lock() {
+            Ok(workers) => workers.len() >= MAX_TELEGRAM_WORKERS,
+            Err(_) => {
+                eprintln!("Memelith Telegram failed to acquire worker lock while throttling");
+                return false;
+            }
+        };
+        if !at_capacity {
+            return true;
+        }
+        match stop_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 fn runtime_error_message(error: &TelegramError) -> String {
     match error {
         TelegramError::Request(error) if error.is_timeout() => "Telegram 请求超时".to_owned(),
@@ -518,7 +545,7 @@ fn runtime_error_message(error: &TelegramError) -> String {
         }
         TelegramError::Request(error) => match error.status() {
             Some(status) => format!("Telegram 请求失败（HTTP {status}）"),
-            None => "Telegram 网络请求失败".to_owned(),
+            None => format!("Telegram 网络请求失败：{error}"),
         },
         error => error.to_string(),
     }

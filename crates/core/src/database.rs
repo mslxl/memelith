@@ -165,6 +165,113 @@ impl MemeDatabase {
         Ok(matches)
     }
 
+    /// Finds memes whose stored CLIP embeddings are closest to a text query.
+    /// A meme is represented by the best matching embedding across its own
+    /// metadata, text contents, media previews, and (for text-only memes) tags.
+    pub fn search_memes_semantic(
+        &mut self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::SemanticMemeMatch>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vector = self
+            .embedding_provider
+            .embed_text(query)
+            .map_err(Error::EmbeddingProvider)?;
+        let query_embedding = encode_embedding("semantic query", vector, self.embedding_dimension)?;
+        let mut scores = std::collections::HashMap::<Uuid, f32>::new();
+        let mut content_memes = std::collections::HashSet::<Uuid>::new();
+        let mut statement = self.connection.prepare(
+            "SELECT m.id, m.name_embedding, m.description_embedding, c.embedding
+             FROM memes m
+             LEFT JOIN meme_contents c ON c.meme_id = m.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                uuid_from_column(row, 0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (meme_id, name, description, content) = row?;
+            if let Some(embedding) = content {
+                let similarity = cosine_similarity_between_encoded_embeddings(
+                    &query_embedding,
+                    &embedding,
+                    self.embedding_dimension,
+                )?;
+                scores
+                    .entry(meme_id)
+                    .and_modify(|score| *score = score.max(similarity))
+                    .or_insert(similarity);
+                content_memes.insert(meme_id);
+            } else {
+                for embedding in [name, description].into_iter().flatten() {
+                    let similarity = cosine_similarity_between_encoded_embeddings(
+                        &query_embedding,
+                        &embedding,
+                        self.embedding_dimension,
+                    )?;
+                    scores
+                        .entry(meme_id)
+                        .and_modify(|score| *score = score.max(similarity))
+                        .or_insert(similarity);
+                }
+            }
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT mt.meme_id, t.name_embedding
+             FROM meme_tags mt JOIN tags t ON t.id = mt.tag_id
+             UNION ALL
+             SELECT m.id, t.name_embedding
+             FROM memes m
+             JOIN meme_pack_tags pt ON pt.meme_pack_id = m.meme_pack_id
+             JOIN tags t ON t.id = pt.tag_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((uuid_from_column(row, 0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (meme_id, embedding) = row?;
+            if content_memes.contains(&meme_id) {
+                continue;
+            }
+            let similarity = cosine_similarity_between_encoded_embeddings(
+                &query_embedding,
+                &embedding,
+                self.embedding_dimension,
+            )?;
+            scores
+                .entry(meme_id)
+                .and_modify(|score| *score = score.max(similarity))
+                .or_insert(similarity);
+        }
+
+        let mut matches = scores
+            .into_iter()
+            .map(|(meme_id, similarity)| crate::SemanticMemeMatch {
+                meme_id,
+                similarity,
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .similarity
+                .total_cmp(&left.similarity)
+                .then_with(|| left.meme_id.cmp(&right.meme_id))
+        });
+        if limit > 0 {
+            matches.truncate(limit);
+        }
+        Ok(matches)
+    }
+
     /// Finds exact and visually similar images without changing the database.
     ///
     /// This is used by integrations that need to ask for confirmation before
@@ -2824,6 +2931,14 @@ fn cosine_distance_between_encoded_embeddings(
     let similarity =
         (dot / (left_squared_norm.sqrt() * right_squared_norm.sqrt())).clamp(-1.0, 1.0);
     Ok((1.0 - similarity) as f32)
+}
+
+fn cosine_similarity_between_encoded_embeddings(
+    left: &[u8],
+    right: &[u8],
+    expected_dimension: usize,
+) -> Result<f32> {
+    Ok(1.0 - cosine_distance_between_encoded_embeddings(left, right, expected_dimension)?)
 }
 
 fn decode_embedding(

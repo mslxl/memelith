@@ -67,6 +67,12 @@ pub struct SimilarMemeImage {
     pub cosine_distance: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticMemeMatch {
+    pub meme_id: Uuid,
+    pub similarity: f32,
+}
+
 /// An image already present in the library that matches an incoming image.
 ///
 /// The source can be either a saved Meme or another Collector item. Exact

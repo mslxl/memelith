@@ -12,7 +12,8 @@ pub use model::{
     CollectorContent, CollectorDuplicate, CollectorDuplicateSource, CollectorDuplicateTarget,
     CollectorItem, EffectiveTag, ImageDuplicate, ImageFormat, Meme, MemeContent, MemeImage,
     MemeMotion, MemePack, MemeText, MotionFormat, NewMeme, NewMemeContent, NewMemeFromCollector,
-    NewMemePack, NewTag, SimilarMemeImage, Tag, UpdateMemeMetadata, UpdateMemePack,
+    NewMemePack, NewTag, SemanticMemeMatch, SimilarMemeImage, Tag, UpdateMemeMetadata,
+    UpdateMemePack,
 };
 
 pub const APPLICATION_NAME: &str = "Memelith";

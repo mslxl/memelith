@@ -17,17 +17,17 @@ use gpui::{
     AnyElement, App, Application, Bounds, BoxShadow, Context, Corner, DevicePixels, Div, Element,
     ElementId, Entity, Focusable, FontWeight, GlobalElementId, InspectorElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point,
-    PromptButton, PromptLevel, SharedString, Stateful, Style, StyleRefinement, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowOptions, actions, anchored,
-    deferred, div, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative,
-    rgb, rgba, size,
+    PromptButton, PromptLevel, SharedString, Stateful, Style, StyleRefinement,
+    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowOptions, actions, anchored, deferred, div, hsla, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px, relative, rgb, rgba, size, uniform_list,
 };
 use input::{TextChanged, TextInput};
 use memelith_clip::{ClipModel, ExecutionPolicy};
 use memelith_core::{
     APPLICATION_NAME, CollectorContent, CollectorDuplicate, CollectorItem, Meme, MemeContent,
     MemeDatabase, MemePack, NewMeme, NewMemeContent, NewMemeFromCollector, NewMemePack, NewTag,
-    SimilarMemeImage, Tag,
+    SemanticMemeMatch, SimilarMemeImage, Tag,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -494,6 +494,18 @@ struct ImageAnalysisBatch {
     results: Vec<ImageAnalysisResult>,
 }
 
+struct SemanticSearchBatch {
+    database: MemeDatabase,
+    result: Result<Vec<SemanticMemeMatch>, String>,
+}
+
+enum SemanticSearchDatabase {
+    Ready(MemeDatabase),
+    Busy,
+    Unavailable,
+    Cancelled,
+}
+
 struct CollectorImportResult {
     label: String,
     result: Result<CollectorItem, String>,
@@ -567,6 +579,12 @@ struct MemelithView {
     collector_text_input: Entity<TextInput>,
     meme_search_input: Entity<TextInput>,
     meme_search: Result<Option<search::SearchExpression>, search::SearchError>,
+    semantic_search_results: Option<Vec<SemanticMemeMatch>>,
+    semantic_search_generation: u64,
+    semantic_searching: bool,
+    semantic_search_pending: Option<String>,
+    all_scroll_handle: UniformListScrollHandle,
+    collector_scroll_handle: UniformListScrollHandle,
     telegram_token_input: Entity<TextInput>,
     telegram_enabled: bool,
     telegram_applied_enabled: bool,
@@ -632,6 +650,12 @@ impl MemelithView {
             collector_text_input: cx.new(|cx| TextInput::new("快速收集一段文字", cx)),
             meme_search_input: meme_search_input.clone(),
             meme_search: Ok(None),
+            semantic_search_results: None,
+            semantic_search_generation: 0,
+            semantic_searching: false,
+            semantic_search_pending: None,
+            all_scroll_handle: UniformListScrollHandle::new(),
+            collector_scroll_handle: UniformListScrollHandle::new(),
             telegram_token_input,
             telegram_enabled,
             telegram_applied_enabled: telegram_enabled,
@@ -657,7 +681,24 @@ impl MemelithView {
             .detach();
         cx.subscribe(&meme_search_input, |view, input, _: &TextChanged, cx| {
             let query = input.read(cx).text();
-            view.meme_search = search::SearchExpression::parse(&query);
+            if let Some(semantic_query) = query
+                .strip_prefix("semantic:")
+                .or_else(|| query.strip_prefix("clip:"))
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
+            {
+                view.meme_search = Ok(None);
+                view.start_semantic_search(semantic_query.to_owned(), cx);
+            } else if is_plain_semantic_query(&query) {
+                view.meme_search = search::SearchExpression::parse(&query);
+                view.start_semantic_search(query, cx);
+            } else {
+                view.semantic_search_generation = view.semantic_search_generation.wrapping_add(1);
+                view.semantic_search_results = None;
+                view.semantic_searching = false;
+                view.semantic_search_pending = None;
+                view.meme_search = search::SearchExpression::parse(&query);
+            }
             cx.notify();
         })
         .detach();
@@ -767,6 +808,80 @@ impl MemelithView {
         if matches!(self.model_setup_state, ModelSetupState::Failed(_)) {
             self.start_model_setup(cx);
         }
+    }
+
+    fn start_semantic_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.semantic_search_generation = self.semantic_search_generation.wrapping_add(1);
+        let generation = self.semantic_search_generation;
+        self.semantic_search_pending = Some(query.clone());
+        self.semantic_search_results = None;
+        self.semantic_searching = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let database = loop {
+                let current = this.update(cx, |view, _| {
+                    if view.semantic_search_generation != generation
+                        || view.semantic_search_pending.as_deref() != Some(query.as_str())
+                    {
+                        return SemanticSearchDatabase::Cancelled;
+                    }
+                    match view.database.take() {
+                        Some(database) => SemanticSearchDatabase::Ready(database),
+                        None if view.storage_root.is_some() => SemanticSearchDatabase::Busy,
+                        None => SemanticSearchDatabase::Unavailable,
+                    }
+                });
+                match current {
+                    Ok(SemanticSearchDatabase::Ready(database)) => break database,
+                    Ok(SemanticSearchDatabase::Busy) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
+                    }
+                    Ok(SemanticSearchDatabase::Cancelled) | Err(_) => return,
+                    Ok(SemanticSearchDatabase::Unavailable) => {
+                        let _ = this.update(cx, |view, cx| {
+                            if view.semantic_search_generation == generation {
+                                view.semantic_searching = false;
+                            }
+                            cx.notify();
+                        });
+                        return;
+                    }
+                }
+            };
+            let completed_query = query.clone();
+            let batch = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut database = database;
+                    let result = database
+                        .search_memes_semantic(&query, 48)
+                        .map_err(|error| error.to_string());
+                    SemanticSearchBatch { database, result }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.database = Some(batch.database);
+                if view.semantic_search_generation != generation {
+                    cx.notify();
+                    return;
+                }
+                view.semantic_searching = false;
+                view.semantic_search_pending = Some(completed_query);
+                match batch.result {
+                    Ok(results) => view.semantic_search_results = Some(results),
+                    Err(error) => {
+                        view.semantic_search_results = Some(Vec::new());
+                        view.notice = Some(Notice::Error(format!("语义搜索失败：{error}")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn activate_storage(&mut self, path: PathBuf, persist: bool, cx: &mut Context<Self>) {
@@ -2745,7 +2860,7 @@ impl MemelithView {
             .into_any_element()
     }
 
-    fn render_collector_page(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_collector_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let duplicate_count = self
             .collector_items
             .iter()
@@ -2763,6 +2878,11 @@ impl MemelithView {
             self.selected_collector_items.len()
         };
         let processing = self.collecting || self.analyzing_images || self.detecting_characters;
+        let available_width = (window.viewport_size().width / px(1.)) - 300.;
+        let columns = (available_width / 226.).floor().max(1.) as usize;
+        let row_count = visible_items.len().div_ceil(columns);
+        let visible_item_ids = visible_items.iter().map(|item| item.id).collect::<Vec<_>>();
+        let collector_scroll_handle = self.collector_scroll_handle.clone();
 
         div()
             .size_full()
@@ -2887,7 +3007,6 @@ impl MemelithView {
                     .id("collector-page-scroll")
                     .min_h_0()
                     .flex_1()
-                    .overflow_y_scroll()
                     .px_8()
                     .pb_8()
                     .when(visible_items.is_empty(), |element| {
@@ -2919,13 +3038,36 @@ impl MemelithView {
                                 )),
                         )
                     })
-                    .child(
-                        div().flex().flex_wrap().gap_4().children(
-                            visible_items
-                                .into_iter()
-                                .map(|item| self.render_collector_item(item, cx)),
-                        ),
-                    ),
+                    .when(!visible_item_ids.is_empty(), |element| {
+                        element.child(
+                            uniform_list(
+                                "collector-items-list",
+                                row_count,
+                                cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                                    range
+                                        .map(|row| {
+                                            let start = row * columns;
+                                            let end = (start + columns).min(visible_item_ids.len());
+                                            div().h(px(236.)).w_full().flex().gap_4().children(
+                                                visible_item_ids[start..end].iter().filter_map(
+                                                    |item_id| {
+                                                        view.collector_items
+                                                            .iter()
+                                                            .find(|item| item.id == *item_id)
+                                                            .map(|item| {
+                                                                view.render_collector_item(item, cx)
+                                                            })
+                                                    },
+                                                ),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .size_full()
+                            .track_scroll(collector_scroll_handle),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -3691,15 +3833,22 @@ impl MemelithView {
             .into_any_element()
     }
 
-    fn render_all_page(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_all_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let query = self.meme_search_input.read(cx).text();
         let search_error = self.meme_search.as_ref().err().map(ToString::to_string);
-        let visible_memes = self
+        let semantic_ranks = self.semantic_search_results.as_ref().map(|matches| {
+            matches
+                .iter()
+                .enumerate()
+                .map(|(rank, matched)| (matched.meme_id, rank))
+                .collect::<HashMap<_, _>>()
+        });
+        let mut visible_indices = self
             .memes
             .iter()
             .enumerate()
             .filter(|(_, meme)| {
-                self.meme_search.as_ref().is_ok_and(|expression| {
+                let text_matches = self.meme_search.as_ref().is_ok_and(|expression| {
                     expression.as_ref().is_none_or(|expression| {
                         expression.matches(
                             meme,
@@ -3710,16 +3859,35 @@ impl MemelithView {
                                 .unwrap_or(&[]),
                         )
                     })
-                })
+                });
+                semantic_ranks
+                    .as_ref()
+                    .map_or(text_matches, |ranks| ranks.contains_key(&meme.id))
             })
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        let has_no_matches =
-            search_error.is_none() && !query.trim().is_empty() && visible_memes.is_empty();
+        if let Some(ranks) = &semantic_ranks {
+            visible_indices.sort_by_key(|index| {
+                ranks
+                    .get(&self.memes[*index].id)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let has_no_matches = search_error.is_none()
+            && !self.semantic_searching
+            && !query.trim().is_empty()
+            && visible_indices.is_empty();
+
+        let available_width = (window.viewport_size().width / px(1.)) - 300.;
+        let columns = (available_width / 260.).floor().max(1.) as usize;
+        let row_count = visible_indices.len().div_ceil(columns);
+        let list_indices = visible_indices.clone();
+        let scroll_handle = self.all_scroll_handle.clone();
 
         div()
             .size_full()
             .id("all-page-scroll")
-            .overflow_y_scroll()
             .px_8()
             .pb_8()
             .flex()
@@ -3734,6 +3902,15 @@ impl MemelithView {
                     .flex_col()
                     .gap_1()
                     .child(self.meme_search_input.clone())
+                    .when(self.semantic_searching, |element| {
+                        element.child(
+                            div()
+                                .px_2()
+                                .text_xs()
+                                .text_color(rgba(LABEL_2))
+                                .child("正在进行 CLIP 语义搜索…"),
+                        )
+                    })
                     .when_some(search_error, |element, error| {
                         element.child(div().px_2().text_xs().text_color(rgb(DANGER)).child(error))
                     }),
@@ -3797,13 +3974,32 @@ impl MemelithView {
                         ),
                 )
             })
-            .child(
-                div().flex().flex_wrap().gap_5().children(
-                    visible_memes
-                        .into_iter()
-                        .map(|(index, meme)| self.render_meme(index, meme)),
-                ),
-            )
+            .when(!visible_indices.is_empty(), |element| {
+                element.child(
+                    div().relative().flex_1().min_h_0().child(
+                        uniform_list(
+                            "all-memes-list",
+                            row_count,
+                            cx.processor(move |view, range: std::ops::Range<usize>, _, _| {
+                                range
+                                    .map(|row| {
+                                        let start = row * columns;
+                                        let end = (start + columns).min(list_indices.len());
+                                        div().h(px(280.)).w_full().flex().gap_5().children(
+                                            list_indices[start..end].iter().map(|&index| {
+                                                let meme = &view.memes[index];
+                                                view.render_meme(index, meme)
+                                            }),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .size_full()
+                        .track_scroll(scroll_handle),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
@@ -3902,6 +4098,8 @@ impl MemelithView {
         glass_card()
             .id(("meme", index))
             .w(px(240.))
+            .h(px(260.))
+            .flex_none()
             .overflow_hidden()
             .cursor_pointer()
             .hover(|style| style.bg(rgba(GLASS_STRONG)))
@@ -4303,7 +4501,7 @@ impl Drop for MemelithView {
 }
 
 impl Render for MemelithView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.installed_models.is_none() {
             return self.render_model_setup(cx);
         }
@@ -4312,9 +4510,9 @@ impl Render for MemelithView {
         }
 
         let page = match self.page {
-            Page::Collector => self.render_collector_page(cx),
+            Page::Collector => self.render_collector_page(window, cx),
             Page::Add => self.render_add_page(cx),
-            Page::All => self.render_all_page(cx),
+            Page::All => self.render_all_page(window, cx),
             Page::MemePacks => self.render_meme_packs_page(cx),
             Page::Settings => self.render_settings_page(cx),
         };
@@ -4979,6 +5177,11 @@ fn format_download_bytes(bytes: u64) -> String {
 fn optional_input_text(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn is_plain_semantic_query(query: &str) -> bool {
+    let query = query.trim();
+    query.chars().count() >= 2 && !query.contains(':')
 }
 
 #[derive(Debug)]
