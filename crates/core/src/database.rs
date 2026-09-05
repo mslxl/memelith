@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -473,6 +473,33 @@ impl MemeDatabase {
             .collect()
     }
 
+    pub fn list_collector_items_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<CollectorItem>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| Error::InvalidDatabase("collector page limit is too large".to_owned()))?;
+        let offset = i64::try_from(offset)
+            .map_err(|_| Error::InvalidDatabase("collector page offset is too large".to_owned()))?;
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, kind, text, relative_path, preview_relative_path, width, height,
+                        byte_size, image_format, motion_format, content_hash, embedding,
+                        duplicate_kind, duplicate_target_source, duplicate_target_id,
+                        duplicate_distance, duplicate_dismissed
+                 FROM collector_items
+                 ORDER BY rowid DESC LIMIT ?1 OFFSET ?2",
+            )?;
+            statement
+                .query_map(params![limit, offset], map_raw_collector_item)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        rows.into_iter()
+            .map(|row| row.into_domain(&self.connection, &self.storage_root))
+            .collect()
+    }
+
     pub fn recheck_collector_items(&mut self) -> Result<Vec<CollectorItem>> {
         let transaction = self
             .connection
@@ -490,8 +517,65 @@ impl MemeDatabase {
                 .query_map([], map_raw_collector_item)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
+        // Load the similarity candidates once. The previous implementation
+        // rebuilt both candidate queries for every Collector row, which made
+        // a refresh quadratic in the number of stored media embeddings.
+        let mut candidates = HashMap::<String, Vec<DuplicateCandidate>>::new();
+        for kind in ["image", "motion", "text"] {
+            candidates.insert(
+                kind.to_owned(),
+                Self::duplicate_candidates(&transaction, kind, None)?,
+            );
+        }
+        let rowids = {
+            let mut statement = transaction.prepare("SELECT id, rowid FROM collector_items")?;
+            statement
+                .query_map([], |row| {
+                    Ok((uuid_from_column(row, 0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?
+        };
         for row in &rows {
-            Self::recheck_collector_duplicate(&transaction, self.embedding_dimension, row)?;
+            let duplicate = if let Some(target) =
+                Self::find_hash_duplicate(&transaction, &row.kind, &row.content_hash, Some(row.id))?
+            {
+                Some(DetectedDuplicate::Hash { target })
+            } else if row.duplicate_dismissed {
+                None
+            } else if let Some(embedding) = row.embedding.as_deref() {
+                let current_rowid = rowids.get(&row.id).copied().unwrap_or(i64::MAX);
+                let closest = candidates
+                    .get(&row.kind)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| {
+                        candidate.target.source != CollectorDuplicateSource::Collector
+                            || rowids
+                                .get(&candidate.target.content_id)
+                                .copied()
+                                .is_some_and(|candidate_rowid| candidate_rowid < current_rowid)
+                    })
+                    .filter_map(|candidate| {
+                        let distance = cosine_distance_between_encoded_embeddings(
+                            embedding,
+                            &candidate.embedding,
+                            self.embedding_dimension,
+                        )
+                        .ok()?;
+                        (distance <= COLLECTOR_DUPLICATE_MAX_COSINE_DISTANCE)
+                            .then_some((candidate.target, distance))
+                    })
+                    .min_by(|left, right| left.1.total_cmp(&right.1));
+                closest.map(|(target, cosine_distance)| DetectedDuplicate::Similarity {
+                    target,
+                    cosine_distance,
+                })
+            } else {
+                None
+            };
+            let dismissed = row.duplicate_dismissed
+                && !matches!(&duplicate, Some(DetectedDuplicate::Hash { .. }));
+            update_collector_duplicate(&transaction, row.id, duplicate.as_ref(), dismissed)?;
         }
         transaction.commit()?;
         self.list_collector_items()
@@ -873,6 +957,72 @@ impl MemeDatabase {
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         ids.into_iter().map(|id| self.get_meme(id)).collect()
+    }
+
+    pub fn list_all_memes_page(&self, offset: usize, limit: usize) -> Result<Vec<Meme>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| Error::InvalidDatabase("meme page limit is too large".to_owned()))?;
+        let offset = i64::try_from(offset)
+            .map_err(|_| Error::InvalidDatabase("meme page offset is too large".to_owned()))?;
+        let mut statement = self.connection.prepare(
+            "SELECT m.id, m.meme_pack_id, m.name, m.description,
+                    c.id, c.kind, c.text, c.relative_path, c.preview_relative_path,
+                    c.width, c.height, c.byte_size, c.image_format, c.motion_format
+             FROM (SELECT id, meme_pack_id, name, description, rowid
+                   FROM memes ORDER BY rowid DESC LIMIT ?1 OFFSET ?2) m
+             JOIN meme_contents c ON c.meme_id = m.id
+             ORDER BY m.rowid DESC, c.position",
+        )?;
+        let mut order = Vec::new();
+        let mut grouped =
+            HashMap::<Uuid, (Uuid, Option<String>, Option<String>, Vec<RawContent>)>::new();
+        let rows = statement.query_map(params![limit, offset], |row| {
+            let meme_id = uuid_from_column(row, 0)?;
+            let pack_id = uuid_from_column(row, 1)?;
+            let name: Option<String> = row.get(2)?;
+            let description: Option<String> = row.get(3)?;
+            let entry = grouped.entry(meme_id).or_insert_with(|| {
+                order.push(meme_id);
+                (pack_id, name, description, Vec::new())
+            });
+            entry.3.push(RawContent {
+                id: uuid_from_column(row, 4)?,
+                kind: row.get(5)?,
+                text: row.get(6)?,
+                relative_path: row.get(7)?,
+                preview_relative_path: row.get(8)?,
+                width: row.get(9)?,
+                height: row.get(10)?,
+                byte_size: row.get(11)?,
+                image_format: row.get(12)?,
+                motion_format: row.get(13)?,
+            });
+            Ok(())
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        order
+            .into_iter()
+            .map(|id| {
+                let (meme_pack_id, name, description, contents) =
+                    grouped.remove(&id).ok_or(Error::MemeNotFound(id))?;
+                let contents = contents
+                    .into_iter()
+                    .map(|row| row.into_domain(&self.storage_root))
+                    .collect::<Result<Vec<_>>>()?;
+                if contents.is_empty() {
+                    return Err(Error::InvalidDatabase(format!(
+                        "Meme {id} has no content blocks"
+                    )));
+                }
+                Ok(Meme {
+                    id,
+                    meme_pack_id,
+                    name,
+                    description,
+                    contents,
+                })
+            })
+            .collect()
     }
 
     pub fn update_meme_metadata(&mut self, id: Uuid, input: UpdateMemeMetadata) -> Result<Meme> {

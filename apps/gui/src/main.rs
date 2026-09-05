@@ -39,7 +39,13 @@ use waifu_sensor::{
 const INBOX_NAME: &str = "Inbox";
 const DUPLICATE_IMAGE_MAX_COSINE_DISTANCE: f32 = 0.05;
 const MAX_TAG_SUGGESTIONS: usize = 6;
+const LIBRARY_PAGE_SIZE: usize = 96;
 const WAIFU_SENSOR_DATABASE_FILENAME: &str = "waifu-sensor.sqlite3";
+
+// The GUI and Telegram bot deliberately share this single connection. Every
+// database operation must hold the mutex only for the duration of the
+// operation, so SQLite never sees competing connections from this process.
+pub(crate) type SharedDatabase = Arc<Mutex<MemeDatabase>>;
 
 static BLURRED_PREVIEW_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<gpui::RenderImage>>>> =
     OnceLock::new();
@@ -465,7 +471,6 @@ enum Notice {
 enum TelegramRuntimeState {
     Stopped,
     Starting,
-    LoadingModel,
     Running,
     Stopping,
     Failed(String),
@@ -490,18 +495,17 @@ struct ImageAnalysisResult {
 }
 
 struct ImageAnalysisBatch {
-    database: MemeDatabase,
+    database: SharedDatabase,
     results: Vec<ImageAnalysisResult>,
 }
 
 struct SemanticSearchBatch {
-    database: MemeDatabase,
+    database: SharedDatabase,
     result: Result<Vec<SemanticMemeMatch>, String>,
 }
 
 enum SemanticSearchDatabase {
-    Ready(MemeDatabase),
-    Busy,
+    Ready(SharedDatabase),
     Unavailable,
     Cancelled,
 }
@@ -512,7 +516,7 @@ struct CollectorImportResult {
 }
 
 struct CollectorImportBatch {
-    database: MemeDatabase,
+    database: SharedDatabase,
     results: Vec<CollectorImportResult>,
 }
 
@@ -542,7 +546,7 @@ enum UiError {
 }
 
 struct OpenedLibrary {
-    database: MemeDatabase,
+    database: SharedDatabase,
     inbox_id: Uuid,
     memes: Vec<Meme>,
     meme_tags: HashMap<Uuid, Vec<Tag>>,
@@ -550,10 +554,23 @@ struct OpenedLibrary {
     pack_names: HashMap<Uuid, String>,
     tags: Vec<Tag>,
     collector_items: Vec<CollectorItem>,
+    memes_has_more: bool,
+    collector_has_more: bool,
+}
+
+struct LibrarySnapshot {
+    memes: Vec<Meme>,
+    meme_tags: HashMap<Uuid, Vec<Tag>>,
+    meme_packs: Vec<MemePack>,
+    pack_names: HashMap<Uuid, String>,
+    tags: Vec<Tag>,
+    collector_items: Vec<CollectorItem>,
+    memes_has_more: bool,
+    collector_has_more: bool,
 }
 
 struct MemelithView {
-    database: Option<MemeDatabase>,
+    database: Option<SharedDatabase>,
     waifu_sensor: Option<WaifuSensor>,
     installed_models: Option<model_download::InstalledModels>,
     model_setup_state: ModelSetupState,
@@ -602,6 +619,14 @@ struct MemelithView {
     collecting: bool,
     show_only_collector_duplicates: bool,
     collector_context_menu: Option<CollectorContextMenu>,
+    refresh_generation: u64,
+    refreshing: bool,
+    all_offset: usize,
+    all_has_more: bool,
+    all_loading_more: bool,
+    collector_offset: usize,
+    collector_has_more: bool,
+    collector_loading_more: bool,
 }
 
 impl MemelithView {
@@ -673,6 +698,14 @@ impl MemelithView {
             collecting: false,
             show_only_collector_duplicates: false,
             collector_context_menu: None,
+            refresh_generation: 0,
+            refreshing: false,
+            all_offset: 0,
+            all_has_more: false,
+            all_loading_more: false,
+            collector_offset: 0,
+            collector_has_more: false,
+            collector_loading_more: false,
         };
 
         cx.subscribe(&tags_input, |_, _, _: &TextChanged, cx| cx.notify())
@@ -688,9 +721,11 @@ impl MemelithView {
                 .filter(|query| !query.is_empty())
             {
                 view.meme_search = Ok(None);
+                view.start_full_meme_load(cx);
                 view.start_semantic_search(semantic_query.to_owned(), cx);
             } else if is_plain_semantic_query(&query) {
                 view.meme_search = search::SearchExpression::parse(&query);
+                view.start_full_meme_load(cx);
                 view.start_semantic_search(query, cx);
             } else {
                 view.semantic_search_generation = view.semantic_search_generation.wrapping_add(1);
@@ -698,6 +733,9 @@ impl MemelithView {
                 view.semantic_searching = false;
                 view.semantic_search_pending = None;
                 view.meme_search = search::SearchExpression::parse(&query);
+                if !query.trim().is_empty() {
+                    view.start_full_meme_load(cx);
+                }
             }
             cx.notify();
         })
@@ -820,46 +858,41 @@ impl MemelithView {
             cx.background_executor()
                 .timer(Duration::from_millis(250))
                 .await;
-            let database = loop {
-                let current = this.update(cx, |view, _| {
-                    if view.semantic_search_generation != generation
-                        || view.semantic_search_pending.as_deref() != Some(query.as_str())
-                    {
-                        return SemanticSearchDatabase::Cancelled;
-                    }
-                    match view.database.take() {
-                        Some(database) => SemanticSearchDatabase::Ready(database),
-                        None if view.storage_root.is_some() => SemanticSearchDatabase::Busy,
-                        None => SemanticSearchDatabase::Unavailable,
-                    }
-                });
-                match current {
-                    Ok(SemanticSearchDatabase::Ready(database)) => break database,
-                    Ok(SemanticSearchDatabase::Busy) => {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(50))
-                            .await;
-                    }
-                    Ok(SemanticSearchDatabase::Cancelled) | Err(_) => return,
-                    Ok(SemanticSearchDatabase::Unavailable) => {
-                        let _ = this.update(cx, |view, cx| {
-                            if view.semantic_search_generation == generation {
-                                view.semantic_searching = false;
-                            }
-                            cx.notify();
-                        });
-                        return;
-                    }
+            let database = match this.update(cx, |view, _| {
+                if view.semantic_search_generation != generation
+                    || view.semantic_search_pending.as_deref() != Some(query.as_str())
+                {
+                    return SemanticSearchDatabase::Cancelled;
+                }
+                match view.database.clone() {
+                    Some(database) => SemanticSearchDatabase::Ready(database),
+                    None => SemanticSearchDatabase::Unavailable,
+                }
+            }) {
+                Ok(SemanticSearchDatabase::Ready(database)) => database,
+                Ok(SemanticSearchDatabase::Cancelled) | Err(_) => return,
+                Ok(SemanticSearchDatabase::Unavailable) => {
+                    let _ = this.update(cx, |view, cx| {
+                        if view.semantic_search_generation == generation {
+                            view.semantic_searching = false;
+                        }
+                        cx.notify();
+                    });
+                    return;
                 }
             };
             let completed_query = query.clone();
             let batch = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut database = database;
                     let result = database
-                        .search_memes_semantic(&query, 48)
-                        .map_err(|error| error.to_string());
+                        .lock()
+                        .map_err(|_| "数据库锁已损坏".to_owned())
+                        .and_then(|mut database| {
+                            database
+                                .search_memes_semantic(&query, 48)
+                                .map_err(|error| error.to_string())
+                        });
                     SemanticSearchBatch { database, result }
                 })
                 .await;
@@ -910,33 +943,47 @@ impl MemelithView {
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(opened) => {
-                        let canonical_root = opened.database.storage_root().to_path_buf();
-                        view.database = Some(opened.database);
-                        view.waifu_sensor = None;
-                        view.storage_root = Some(canonical_root.clone());
-                        view.inbox_id = Some(opened.inbox_id);
-                        view.memes = opened.memes;
-                        view.meme_tags = opened.meme_tags;
-                        view.meme_packs = opened.meme_packs;
-                        view.pack_names = opened.pack_names;
-                        view.tags = opened.tags;
-                        view.collector_items = opened.collector_items;
-                        view.collector_refresh_pending = false;
-                        view.selected_collector_items.clear();
-                        view.collector_context_menu = None;
-                        view.reset_add_form(cx);
-                        view.collector_text_input
-                            .update(cx, |input, cx| input.reset(cx));
-                        view.meme_search_input
-                            .update(cx, |input, cx| input.reset(cx));
-                        view.page = Page::All;
-                        if persist {
-                            view.notice = match settings::save_storage_root(&canonical_root) {
-                                Ok(()) => Some(Notice::Success("存储位置已更新".to_owned())),
-                                Err(error) => Some(Notice::Error(format!(
-                                    "存储已打开，但无法记住该位置：{error}"
-                                ))),
-                            };
+                        let canonical_root = opened
+                            .database
+                            .lock()
+                            .ok()
+                            .map(|database| database.storage_root().to_path_buf());
+                        if let Some(canonical_root) = canonical_root {
+                            view.database = Some(opened.database);
+                            view.waifu_sensor = None;
+                            view.storage_root = Some(canonical_root.clone());
+                            view.inbox_id = Some(opened.inbox_id);
+                            view.memes = opened.memes;
+                            view.meme_tags = opened.meme_tags;
+                            view.meme_packs = opened.meme_packs;
+                            view.pack_names = opened.pack_names;
+                            view.tags = opened.tags;
+                            view.collector_items = opened.collector_items;
+                            view.all_offset = view.memes.len();
+                            view.all_has_more = opened.memes_has_more;
+                            view.collector_offset = view.collector_items.len();
+                            view.collector_has_more = opened.collector_has_more;
+                            view.all_loading_more = false;
+                            view.collector_loading_more = false;
+                            view.collector_refresh_pending = false;
+                            view.selected_collector_items.clear();
+                            view.collector_context_menu = None;
+                            view.reset_add_form(cx);
+                            view.collector_text_input
+                                .update(cx, |input, cx| input.reset(cx));
+                            view.meme_search_input
+                                .update(cx, |input, cx| input.reset(cx));
+                            view.page = Page::All;
+                            if persist {
+                                view.notice = match settings::save_storage_root(&canonical_root) {
+                                    Ok(()) => Some(Notice::Success("存储位置已更新".to_owned())),
+                                    Err(error) => Some(Notice::Error(format!(
+                                        "存储已打开，但无法记住该位置：{error}"
+                                    ))),
+                                };
+                            }
+                        } else {
+                            view.notice = Some(Notice::Error("数据库锁已损坏".to_owned()));
                         }
                     }
                     Err(error) => {
@@ -983,33 +1030,23 @@ impl MemelithView {
             self.notice = Some(Notice::Error(format!("Telegram Bot 启动失败：{message}")));
             return;
         }
-        let Some(storage_root) = self.storage_root.clone() else {
+        let Some(database) = self.database.clone() else {
             self.telegram_runtime_state = TelegramRuntimeState::Stopped;
             return;
         };
-        let Some(models) = self.installed_models.as_ref() else {
-            let message = "Telegram Bot 无法加载模型：模型尚未准备完成".to_owned();
-            self.telegram_runtime_state = TelegramRuntimeState::Failed(message.clone());
-            self.notice = Some(Notice::Error(message));
-            return;
-        };
-        let model_directory = models.clip_directory.clone();
         self.telegram_runtime_generation = self.telegram_runtime_generation.wrapping_add(1);
         let generation = self.telegram_runtime_generation;
         self.telegram_runtime_state = TelegramRuntimeState::Starting;
-        let (runtime, status_receiver) = match telegram::TelegramBotHandle::start(
-            storage_root,
-            self.telegram_token.clone(),
-            model_directory,
-        ) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let message = format!("无法启动 Telegram Bot 线程：{error}");
-                self.telegram_runtime_state = TelegramRuntimeState::Failed(message.clone());
-                self.notice = Some(Notice::Error(message));
-                return;
-            }
-        };
+        let (runtime, status_receiver) =
+            match telegram::TelegramBotHandle::start(self.telegram_token.clone(), database) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let message = format!("无法启动 Telegram Bot 线程：{error}");
+                    self.telegram_runtime_state = TelegramRuntimeState::Failed(message.clone());
+                    self.notice = Some(Notice::Error(message));
+                    return;
+                }
+            };
         self.telegram_runtime = Some(runtime);
         self.observe_telegram_status(generation, status_receiver, cx);
     }
@@ -1066,11 +1103,6 @@ impl MemelithView {
                     self.telegram_runtime_state = TelegramRuntimeState::Starting;
                 }
             }
-            telegram::TelegramBotStatus::LoadingModel => {
-                if self.telegram_runtime_state != TelegramRuntimeState::Stopping {
-                    self.telegram_runtime_state = TelegramRuntimeState::LoadingModel;
-                }
-            }
             telegram::TelegramBotStatus::Running => {
                 if self.telegram_runtime_state != TelegramRuntimeState::Stopping {
                     self.telegram_runtime_state = TelegramRuntimeState::Running;
@@ -1109,11 +1141,7 @@ impl MemelithView {
                         "贴纸包「{title}」已更新：新增 {added} 张，跳过 {skipped} 张"
                     )));
                 }
-                if let Err(error) = self.refresh_library() {
-                    self.notice = Some(Notice::Error(format!(
-                        "贴纸包已同步，但刷新列表失败：{error}"
-                    )));
-                }
+                self.start_refresh_library(cx);
             }
             telegram::TelegramBotStatus::StickerPackSyncFailed {
                 pack_id,
@@ -1164,9 +1192,7 @@ impl MemelithView {
             return;
         }
         match self.telegram_runtime_state {
-            TelegramRuntimeState::Starting
-            | TelegramRuntimeState::LoadingModel
-            | TelegramRuntimeState::Running => {
+            TelegramRuntimeState::Starting | TelegramRuntimeState::Running => {
                 self.telegram_runtime.take();
                 self.telegram_sticker_syncing.clear();
                 let message = "Bot 线程意外退出".to_owned();
@@ -1197,7 +1223,6 @@ impl MemelithView {
             }
             TelegramRuntimeState::Stopped => "已停止".to_owned(),
             TelegramRuntimeState::Starting => "正在启动…".to_owned(),
-            TelegramRuntimeState::LoadingModel => "正在加载模型…".to_owned(),
             TelegramRuntimeState::Running => "正在运行".to_owned(),
             TelegramRuntimeState::Stopping => "正在停止…".to_owned(),
             TelegramRuntimeState::Failed(message) => format!("启动失败：{message}"),
@@ -1248,7 +1273,7 @@ impl MemelithView {
                         self.start_telegram_bot(cx);
                     }
                     match self.telegram_runtime_state {
-                        TelegramRuntimeState::Starting | TelegramRuntimeState::LoadingModel => {
+                        TelegramRuntimeState::Starting => {
                             self.notice = Some(Notice::Success(
                                 "Telegram 设置已保存，Bot 正在启动".to_owned(),
                             ));
@@ -1364,7 +1389,7 @@ impl MemelithView {
         cx.spawn(async move |this, cx| match receiver.await {
             Ok(Ok(Some(paths))) => {
                 let database = match this.update(cx, |view, cx| {
-                    let database = view.database.take();
+                    let database = view.database.clone();
                     if database.is_some() {
                         view.analyzing_images = true;
                         view.collector_context_menu = None;
@@ -1471,7 +1496,7 @@ impl MemelithView {
         cx.spawn(async move |this, cx| match receiver.await {
             Ok(Ok(Some(paths))) => {
                 let database = match this.update(cx, |view, cx| {
-                    let database = view.database.take();
+                    let database = view.database.clone();
                     if database.is_some() {
                         view.collecting = true;
                         view.collector_context_menu = None;
@@ -1531,7 +1556,7 @@ impl MemelithView {
             cx.notify();
             return;
         }
-        let database = self.database.take();
+        let database = self.database.clone();
         let Some(database) = database else {
             self.notice = Some(Notice::Error("数据库尚未打开".to_owned()));
             cx.notify();
@@ -1836,12 +1861,16 @@ impl MemelithView {
             cx.notify();
             return;
         }
-        let Some(database) = self.database.as_mut() else {
+        let Some(database) = self.database.clone() else {
             self.notice = Some(Notice::Error("数据库尚未打开".to_owned()));
             cx.notify();
             return;
         };
-        match database.dismiss_collector_similarity(item_id) {
+        match database
+            .lock()
+            .map_err(|_| memelith_core::Error::InvalidDatabase("database lock poisoned".to_owned()))
+            .and_then(|mut database| database.dismiss_collector_similarity(item_id))
+        {
             Ok(updated) => {
                 let Some(item) = self
                     .collector_items
@@ -1919,12 +1948,16 @@ impl MemelithView {
     }
 
     fn delete_collector_item(&mut self, item_id: Uuid, cx: &mut Context<Self>) {
-        let Some(database) = self.database.as_mut() else {
+        let Some(database) = self.database.clone() else {
             self.notice = Some(Notice::Error("数据库尚未打开".to_owned()));
             cx.notify();
             return;
         };
-        if let Err(error) = database.delete_collector_item(item_id) {
+        if let Err(error) = database
+            .lock()
+            .map_err(|_| memelith_core::Error::InvalidDatabase("database lock poisoned".to_owned()))
+            .and_then(|mut database| database.delete_collector_item(item_id))
+        {
             self.notice = Some(Notice::Error(format!("无法删除 Collector 条目：{error}")));
             cx.notify();
             return;
@@ -2303,10 +2336,18 @@ impl MemelithView {
             return;
         }
 
-        let Some(database) = self.database.as_mut() else {
+        let Some(database) = self.database.clone() else {
             self.notice = Some(Notice::Error("数据库尚未打开".to_owned()));
             cx.notify();
             return;
+        };
+        let mut database = match database.lock() {
+            Ok(database) => database,
+            Err(_) => {
+                self.notice = Some(Notice::Error("数据库锁已损坏".to_owned()));
+                cx.notify();
+                return;
+            }
         };
         let (result, tags_to_attach) = if collector_draft {
             (
@@ -2350,6 +2391,7 @@ impl MemelithView {
         let meme = match result {
             Ok(meme) => meme,
             Err(error) => {
+                drop(database);
                 let message = if matches!(&error, memelith_core::Error::DuplicateCollectorItem(_)) {
                     match self.refresh_library() {
                         Ok(()) => format!("保存失败：{error}；Collector 重复状态已刷新"),
@@ -2390,6 +2432,7 @@ impl MemelithView {
             }
         }
 
+        drop(database);
         self.reset_add_form(cx);
         if let Err(error) = self.refresh_library() {
             self.notice = Some(Notice::Error(format!(
@@ -2428,31 +2471,196 @@ impl MemelithView {
     }
 
     fn refresh_library(&mut self) -> Result<(), memelith_core::Error> {
-        let database = self.database.as_mut().ok_or_else(|| {
+        let database = self.database.clone().ok_or_else(|| {
             memelith_core::Error::InvalidDatabase("database is not open".to_owned())
         })?;
-        let packs = database.list_meme_packs()?;
-        let memes = database.list_all_memes()?;
-        let meme_tags = load_meme_tags(database)?;
-        let tags = database.list_tags()?;
-        let collector_items = database.recheck_collector_items()?;
-        self.pack_names = packs
-            .iter()
-            .map(|pack| (pack.id, pack.name.clone()))
-            .collect();
-        self.meme_packs = packs;
-        self.memes = memes;
-        self.meme_tags = meme_tags;
-        self.tags = tags;
-        self.apply_collector_items(collector_items);
+        let snapshot = load_library_snapshot(&database, true)?;
+        self.apply_library_snapshot(snapshot);
         Ok(())
     }
 
+    fn start_refresh_library(&mut self, cx: &mut Context<Self>) {
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        self.refresh_generation = self.refresh_generation.wrapping_add(1);
+        let generation = self.refresh_generation;
+        self.refreshing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { load_library_snapshot(&database, false) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.refresh_generation != generation {
+                    return;
+                }
+                view.refreshing = false;
+                match result {
+                    Ok(snapshot) => view.apply_library_snapshot(snapshot),
+                    Err(error) => {
+                        view.notice = Some(Notice::Error(format!("无法刷新 Meme：{error}")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_library_snapshot(&mut self, snapshot: LibrarySnapshot) {
+        self.pack_names = snapshot.pack_names;
+        self.meme_packs = snapshot.meme_packs;
+        self.memes = snapshot.memes;
+        self.meme_tags = snapshot.meme_tags;
+        self.tags = snapshot.tags;
+        self.apply_collector_items(snapshot.collector_items);
+        self.all_offset = self.memes.len();
+        self.all_has_more = snapshot.memes_has_more;
+        self.all_loading_more = false;
+        self.collector_offset = self.collector_items.len();
+        self.collector_has_more = snapshot.collector_has_more;
+        self.collector_loading_more = false;
+    }
+
+    fn load_more_memes(&mut self, cx: &mut Context<Self>) {
+        if self.all_loading_more || !self.all_has_more {
+            return;
+        }
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        let offset = self.all_offset;
+        self.all_loading_more = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let database = database.lock().map_err(|_| {
+                        memelith_core::Error::InvalidDatabase("database lock poisoned".to_owned())
+                    })?;
+                    database.list_all_memes_page(offset, LIBRARY_PAGE_SIZE)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.all_loading_more = false;
+                match result {
+                    Ok(mut memes) => {
+                        view.all_has_more = memes.len() == LIBRARY_PAGE_SIZE;
+                        view.all_offset += memes.len();
+                        view.memes.append(&mut memes);
+                    }
+                    Err(error) => {
+                        view.notice = Some(Notice::Error(format!("无法加载更多 Meme：{error}")))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_full_meme_load(&mut self, cx: &mut Context<Self>) {
+        if self.all_loading_more || !self.all_has_more {
+            return;
+        }
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        self.all_loading_more = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut offset = LIBRARY_PAGE_SIZE;
+                    let mut all = Vec::new();
+                    loop {
+                        let database = database.lock().map_err(|_| {
+                            memelith_core::Error::InvalidDatabase(
+                                "database lock poisoned".to_owned(),
+                            )
+                        })?;
+                        let mut page = database.list_all_memes_page(offset, LIBRARY_PAGE_SIZE)?;
+                        drop(database);
+                        let count = page.len();
+                        all.append(&mut page);
+                        offset += count;
+                        if count < LIBRARY_PAGE_SIZE {
+                            break;
+                        }
+                    }
+                    Ok::<Vec<Meme>, memelith_core::Error>(all)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.all_loading_more = false;
+                match result {
+                    Ok(mut memes) => {
+                        view.all_has_more = false;
+                        view.all_offset += memes.len();
+                        view.memes.append(&mut memes);
+                    }
+                    Err(error) => {
+                        view.notice = Some(Notice::Error(format!("无法加载全部 Meme：{error}")))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_more_collector_items(&mut self, cx: &mut Context<Self>) {
+        if self.collector_loading_more || !self.collector_has_more {
+            return;
+        }
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        let offset = self.collector_offset;
+        self.collector_loading_more = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let database = database.lock().map_err(|_| {
+                        memelith_core::Error::InvalidDatabase("database lock poisoned".to_owned())
+                    })?;
+                    database.list_collector_items_page(offset, LIBRARY_PAGE_SIZE)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.collector_loading_more = false;
+                match result {
+                    Ok(mut items) => {
+                        view.collector_has_more = items.len() == LIBRARY_PAGE_SIZE;
+                        view.collector_offset += items.len();
+                        view.collector_items.append(&mut items);
+                    }
+                    Err(error) => {
+                        view.notice = Some(Notice::Error(format!(
+                            "无法加载更多 Collector 内容：{error}"
+                        )))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn refresh_collector(&mut self) -> Result<(), memelith_core::Error> {
-        let database = self.database.as_ref().ok_or_else(|| {
+        let database = self.database.clone().ok_or_else(|| {
             memelith_core::Error::InvalidDatabase("database is not open".to_owned())
         })?;
+        let database = database.lock().map_err(|_| {
+            memelith_core::Error::InvalidDatabase("database lock poisoned".to_owned())
+        })?;
         let collector_items = database.list_collector_items()?;
+        drop(database);
         self.apply_collector_items(collector_items);
         Ok(())
     }
@@ -2471,14 +2679,13 @@ impl MemelithView {
     }
 
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.page = page;
         if matches!(page, Page::Collector | Page::All | Page::MemePacks)
             && !self.analyzing_images
             && !self.collecting
-            && let Err(error) = self.refresh_library()
         {
-            self.notice = Some(Notice::Error(format!("无法刷新 Meme：{error}")));
+            self.start_refresh_library(cx);
         }
-        self.page = page;
         cx.notify();
     }
 
@@ -3044,6 +3251,9 @@ impl MemelithView {
                                 "collector-items-list",
                                 row_count,
                                 cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                                    if range.end + 2 >= row_count {
+                                        view.load_more_collector_items(cx);
+                                    }
                                     range
                                         .map(|row| {
                                             let start = row * columns;
@@ -3106,7 +3316,7 @@ impl MemelithView {
                 .and_then(|root| {
                     MemeDatabase::resolve_media_path_from_root(root, relative_path).ok()
                 })
-                .map(render_image_preview)
+                .map(|path| render_image_preview(path, 1.21))
                 .unwrap_or_else(|| {
                     div()
                         .size_full()
@@ -3980,7 +4190,10 @@ impl MemelithView {
                         uniform_list(
                             "all-memes-list",
                             row_count,
-                            cx.processor(move |view, range: std::ops::Range<usize>, _, _| {
+                            cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                                if range.end + 2 >= row_count {
+                                    view.load_more_memes(cx);
+                                }
                                 range
                                     .map(|row| {
                                         let start = row * columns;
@@ -4016,7 +4229,7 @@ impl MemelithView {
                 MemeContent::Image(image) => self.storage_root.as_ref().and_then(|storage_root| {
                     MemeDatabase::resolve_media_path_from_root(storage_root, &image.relative_path)
                         .ok()
-                        .map(render_image_preview)
+                        .map(|path| render_image_preview(path, 1.5))
                 }),
                 MemeContent::Motion(motion) => {
                     self.storage_root.as_ref().and_then(|storage_root| {
@@ -4544,7 +4757,9 @@ impl Render for MemelithView {
     }
 }
 
-fn analyze_selected_images(mut database: MemeDatabase, paths: Vec<PathBuf>) -> ImageAnalysisBatch {
+fn analyze_selected_images(database: SharedDatabase, paths: Vec<PathBuf>) -> ImageAnalysisBatch {
+    let database_handle = database.clone();
+    let mut database = database.lock().expect("database lock poisoned");
     let results = paths
         .into_iter()
         .map(|path| {
@@ -4554,13 +4769,16 @@ fn analyze_selected_images(mut database: MemeDatabase, paths: Vec<PathBuf>) -> I
             ImageAnalysisResult { path, result }
         })
         .collect();
-    ImageAnalysisBatch { database, results }
+    drop(database);
+    ImageAnalysisBatch {
+        database: database_handle,
+        results,
+    }
 }
 
-fn collect_selected_images(
-    mut database: MemeDatabase,
-    paths: Vec<PathBuf>,
-) -> CollectorImportBatch {
+fn collect_selected_images(database: SharedDatabase, paths: Vec<PathBuf>) -> CollectorImportBatch {
+    let database_handle = database.clone();
+    let mut database = database.lock().expect("database lock poisoned");
     let results = paths
         .into_iter()
         .map(|path| {
@@ -4574,15 +4792,21 @@ fn collect_selected_images(
             CollectorImportResult { label, result }
         })
         .collect();
-    CollectorImportBatch { database, results }
+    drop(database);
+    CollectorImportBatch {
+        database: database_handle,
+        results,
+    }
 }
 
-fn collect_text_item(mut database: MemeDatabase, text: String) -> CollectorImportBatch {
+fn collect_text_item(database: SharedDatabase, text: String) -> CollectorImportBatch {
+    let database_handle = database.clone();
+    let mut database = database.lock().expect("database lock poisoned");
     let result = database
         .collect_text(text)
         .map_err(|error| error.to_string());
     CollectorImportBatch {
-        database,
+        database: database_handle,
         results: vec![CollectorImportResult {
             label: "文字".to_owned(),
             result,
@@ -4638,12 +4862,15 @@ fn open_waifu_sensor(storage_root: &Path, model_path: &Path) -> waifu_sensor::Re
 
 fn open_library(storage_root: &Path, model_directory: &Path) -> Result<OpenedLibrary, UiError> {
     let model = ClipModel::load(model_directory, ExecutionPolicy::Auto)?;
-    let mut database = MemeDatabase::open(storage_root, model)?;
-    let packs = database.list_meme_packs()?;
+    let database = Arc::new(Mutex::new(MemeDatabase::open(storage_root, model)?));
+    let mut database_guard = database
+        .lock()
+        .map_err(|_| memelith_core::Error::InvalidDatabase("database lock poisoned".to_owned()))?;
+    let packs = database_guard.list_meme_packs()?;
     let inbox_id = if let Some(inbox) = packs.iter().find(|pack| pack.name == INBOX_NAME) {
         inbox.id
     } else {
-        database
+        database_guard
             .create_meme_pack(NewMemePack {
                 name: INBOX_NAME.to_owned(),
                 description: Some("默认收件箱".to_owned()),
@@ -4652,11 +4879,14 @@ fn open_library(storage_root: &Path, model_directory: &Path) -> Result<OpenedLib
             })?
             .id
     };
-    let packs = database.list_meme_packs()?;
-    let memes = database.list_all_memes()?;
-    let meme_tags = load_meme_tags(&database)?;
-    let tags = database.list_tags()?;
-    let collector_items = database.recheck_collector_items()?;
+    let packs = database_guard.list_meme_packs()?;
+    let memes = database_guard.list_all_memes_page(0, LIBRARY_PAGE_SIZE)?;
+    let memes_has_more = memes.len() == LIBRARY_PAGE_SIZE;
+    let meme_tags = load_meme_tags(&database_guard)?;
+    let tags = database_guard.list_tags()?;
+    let collector_items = database_guard.list_collector_items_page(0, LIBRARY_PAGE_SIZE)?;
+    let collector_items_has_more = collector_items.len() == LIBRARY_PAGE_SIZE;
+    drop(database_guard);
     Ok(OpenedLibrary {
         database,
         inbox_id,
@@ -4669,6 +4899,42 @@ fn open_library(storage_root: &Path, model_directory: &Path) -> Result<OpenedLib
         meme_packs: packs,
         tags,
         collector_items,
+        memes_has_more,
+        collector_has_more: collector_items_has_more,
+    })
+}
+
+fn load_library_snapshot(
+    database: &SharedDatabase,
+    recheck_collector: bool,
+) -> Result<LibrarySnapshot, memelith_core::Error> {
+    let mut database = database
+        .lock()
+        .map_err(|_| memelith_core::Error::InvalidDatabase("database lock poisoned".to_owned()))?;
+    let packs = database.list_meme_packs()?;
+    let memes = database.list_all_memes_page(0, LIBRARY_PAGE_SIZE)?;
+    let memes_has_more = memes.len() == LIBRARY_PAGE_SIZE;
+    let meme_tags = load_meme_tags(&database)?;
+    let tags = database.list_tags()?;
+    let mut collector_items = if recheck_collector {
+        database.recheck_collector_items()?
+    } else {
+        database.list_collector_items_page(0, LIBRARY_PAGE_SIZE)?
+    };
+    let collector_has_more = collector_items.len() > LIBRARY_PAGE_SIZE;
+    collector_items.truncate(LIBRARY_PAGE_SIZE);
+    Ok(LibrarySnapshot {
+        pack_names: packs
+            .iter()
+            .map(|pack| (pack.id, pack.name.clone()))
+            .collect(),
+        meme_packs: packs,
+        memes,
+        meme_tags,
+        tags,
+        collector_items,
+        memes_has_more,
+        collector_has_more,
     })
 }
 
@@ -4723,31 +4989,41 @@ fn render_notice(notice: &Notice) -> AnyElement {
         .into_any_element()
 }
 
-fn render_image_preview(path: PathBuf) -> AnyElement {
+fn render_image_preview(path: PathBuf, target_aspect: f32) -> AnyElement {
+    let show_background = image_needs_letterbox_background(&path, target_aspect);
     div()
         .h(px(160.))
         .w_full()
-        .child(render_image_preview_layers(path))
+        .child(render_image_preview_layers(path, show_background))
         .into_any_element()
 }
 
-fn render_image_preview_layers(path: PathBuf) -> AnyElement {
-    let background_path = path.clone();
+fn image_needs_letterbox_background(path: &Path, target_aspect: f32) -> bool {
+    let Ok((width, height)) = image::image_dimensions(path) else {
+        return false;
+    };
+    let aspect = width as f32 / height.max(1) as f32;
+    (aspect - target_aspect).abs() > 0.08
+}
+
+fn render_image_preview_layers(path: PathBuf, show_background: bool) -> AnyElement {
     let image_id = SharedString::from(format!("image-preview-{}", path.display()));
-    div()
+    let mut element = div()
         .relative()
         .size_full()
         .flex_none()
         .overflow_hidden()
-        .bg(rgba(0x3c3c4314))
-        .child(
+        .bg(rgba(0x3c3c4314));
+    if show_background {
+        element = element.child(
             div()
                 .absolute()
                 .inset_0()
                 .size_full()
-                .child(blurred_preview_image(background_path))
-                .child(div().absolute().inset_0().bg(rgba(0x00000038))),
-        )
+                .child(blurred_preview_image(path.clone())),
+        );
+    }
+    element
         .child(
             img(path)
                 .id(image_id)
@@ -4813,7 +5089,8 @@ fn is_image_path(path: &Path) -> bool {
 
 fn render_motion_or_image_preview(path: PathBuf, preview_path: Option<PathBuf>) -> AnyElement {
     if is_image_path(&path) {
-        render_image_preview_layers(path)
+        let show_background = image_needs_letterbox_background(&path, 1.5);
+        render_image_preview_layers(path, show_background)
     } else {
         render_motion_preview(path, preview_path)
     }

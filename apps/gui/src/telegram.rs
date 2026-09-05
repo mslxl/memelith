@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use memelith_clip::{ClipModel, ExecutionPolicy};
+use crate::SharedDatabase;
 use memelith_core::{
     COLLECTOR_DUPLICATE_MAX_COSINE_DISTANCE, MemeDatabase, MotionFormat, NewMeme, NewMemeContent,
     NewMemePack,
@@ -83,7 +83,6 @@ enum TelegramError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TelegramBotStatus {
     Starting,
-    LoadingModel,
     Running,
     CollectorUpdated,
     StickerPackSyncStarted {
@@ -118,9 +117,8 @@ enum TelegramBotCommand {
 
 impl TelegramBotHandle {
     pub fn start(
-        storage_root: PathBuf,
         token: String,
-        model_directory: PathBuf,
+        database: SharedDatabase,
     ) -> std::io::Result<(Self, mpsc::Receiver<TelegramBotStatus>)> {
         let (stop, stop_receiver) = mpsc::channel();
         let (commands, command_receiver) = mpsc::channel();
@@ -129,14 +127,7 @@ impl TelegramBotHandle {
             .name("memelith-telegram".to_owned())
             .spawn(move || {
                 let _ = status.send(TelegramBotStatus::Starting);
-                match run_bot(
-                    storage_root,
-                    token,
-                    model_directory,
-                    stop_receiver,
-                    command_receiver,
-                    &status,
-                ) {
+                match run_bot(token, database, stop_receiver, command_receiver, &status) {
                     Ok(()) => {
                         let _ = status.send(TelegramBotStatus::Stopped);
                     }
@@ -193,7 +184,7 @@ impl Drop for TelegramBotHandle {
 
 struct BotState {
     api: TelegramApi,
-    database: Mutex<MemeDatabase>,
+    database: SharedDatabase,
     storage_root: PathBuf,
     status: mpsc::Sender<TelegramBotStatus>,
     stopping: AtomicBool,
@@ -424,9 +415,8 @@ impl TelegramApi {
 }
 
 fn run_bot(
-    storage_root: PathBuf,
     token: String,
-    model_directory: PathBuf,
+    database: SharedDatabase,
     stop_receiver: mpsc::Receiver<()>,
     command_receiver: mpsc::Receiver<TelegramBotCommand>,
     status: &mpsc::Sender<TelegramBotStatus>,
@@ -436,16 +426,14 @@ fn run_bot(
     if stop_receiver.try_recv().is_ok() {
         return Ok(());
     }
-    let _ = status.send(TelegramBotStatus::LoadingModel);
-    let model = ClipModel::load(model_directory, ExecutionPolicy::Auto)
-        .map_err(|error| TelegramError::Api(format!("failed to load CLIP model: {error}")))?;
-    if stop_receiver.try_recv().is_ok() {
-        return Ok(());
-    }
-    let database = MemeDatabase::open(&storage_root, model)?;
+    let storage_root = database
+        .lock()
+        .map_err(|_| TelegramError::Api("database lock was poisoned".to_owned()))?
+        .storage_root()
+        .to_path_buf();
     let state = Arc::new(BotState {
         api,
-        database: Mutex::new(database),
+        database,
         storage_root,
         status: status.clone(),
         stopping: AtomicBool::new(false),
@@ -788,14 +776,16 @@ fn sync_sticker_set(
             let bytes = state.api.download_file(&file_path)?;
             fs::write(&source_path, bytes)?;
         }
-        let mut database = state
-            .database
-            .lock()
-            .map_err(|_| TelegramError::Api("database lock was poisoned".to_owned()))?;
-        if database
-            .find_meme_with_media_in_pack(pack_id, &source_path)?
-            .is_some()
-        {
+        let already_imported = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| TelegramError::Api("database lock was poisoned".to_owned()))?;
+            database
+                .find_meme_with_media_in_pack(pack_id, &source_path)?
+                .is_some()
+        };
+        if already_imported {
             skipped += 1;
             continue;
         }
@@ -842,6 +832,17 @@ fn sync_sticker_set(
                 source_path: source_path.clone(),
             }
         };
+        let mut database = state
+            .database
+            .lock()
+            .map_err(|_| TelegramError::Api("database lock was poisoned".to_owned()))?;
+        if database
+            .find_meme_with_media_in_pack(pack_id, &source_path)?
+            .is_some()
+        {
+            skipped += 1;
+            continue;
+        }
         database.create_meme(
             pack_id,
             NewMeme {
