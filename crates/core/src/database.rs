@@ -13,19 +13,20 @@ use uuid::Uuid;
 
 use crate::{
     CollectorContent, CollectorDuplicate, CollectorDuplicateSource, CollectorDuplicateTarget,
-    CollectorItem, EffectiveTag, EmbeddingProvider, Error, ImageDuplicate, ImageFormat, Meme,
-    MemeContent, MemeImage, MemeMotion, MemePack, MemeText, MotionFormat, NewMeme, NewMemeContent,
-    NewMemeFromCollector, NewMemePack, NewTag, Result, SimilarMemeImage, Tag, UpdateMemeMetadata,
-    UpdateMemePack,
+    CollectorItem, EffectiveTag, EmbeddingProvider, Error, ImageDuplicate, ImageFormat,
+    ImageSemantics, ImageType, Meme, MemeContent, MemeImage, MemeMotion, MemePack, MemeText,
+    MotionFormat, NewMeme, NewMemeContent, NewMemeFromCollector, NewMemePack, NewTag, Result,
+    SimilarMemeImage, Tag, UpdateImageSemantics, UpdateMemeMetadata, UpdateMemePack,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 4;
 const CONTENT_HASH_BYTES: usize = 32;
 const DATABASE_FILENAME: &str = "memelith.sqlite3";
 const MEDIA_DIRECTORY: &str = "media/images";
 const STAGING_DIRECTORY: &str = ".staging";
 
 pub const COLLECTOR_DUPLICATE_MAX_COSINE_DISTANCE: f32 = 0.05;
+pub const SEMANTIC_MIN_SIMILARITY: f32 = 0.25;
 
 pub struct MemeDatabase {
     storage_root: PathBuf,
@@ -82,9 +83,20 @@ impl MemeDatabase {
             embedding_provider: Box::new(embedding_provider),
             embedding_dimension,
         };
+        database.recover_interrupted_semantic_jobs()?;
         database.clean_staging_directory()?;
         database.collect_orphaned_media()?;
         Ok(database)
+    }
+
+    fn recover_interrupted_semantic_jobs(&self) -> Result<()> {
+        self.connection.execute(
+            "UPDATE meme_contents SET semantic_status = 'pending', semantic_error = NULL
+             WHERE kind IN ('image', 'motion') AND semantic_status = 'running'",
+            [],
+        )?;
+        self.connection.execute("UPDATE image_semantic_state SET embedding_status = 'pending' WHERE embedding_status = 'running'", [])?;
+        Ok(())
     }
 
     pub fn storage_root(&self) -> &Path {
@@ -93,6 +105,749 @@ impl MemeDatabase {
 
     pub fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    pub fn set_manual_image_types(&mut self, selections: &[(Uuid, ImageType)]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        for (content_id, image_type) in selections {
+            // The category participates in semantic text; its vector is no longer valid after a correction.
+            let changed = transaction.execute(
+                "UPDATE meme_contents SET image_type = ?1, image_type_source = 'manual',
+                 image_review_status = 'confirmed', semantic_text_hash = NULL,
+                 semantic_embedding = NULL, semantic_embedding_provider = NULL,
+                 semantic_embedding_model = NULL, semantic_embedding_dimension = NULL
+                 WHERE id = ?2 AND kind IN ('image', 'motion')",
+                params![image_type.as_database_str(), content_id.to_string()],
+            )?;
+            if changed != 1 {
+                return Err(Error::InvalidDatabase(format!(
+                    "image content {content_id} was not found"
+                )));
+            }
+            transaction.execute(
+                "INSERT INTO image_semantic_state(content_id, embedding_status) VALUES (?1, 'pending')
+                 ON CONFLICT(content_id) DO UPDATE SET embedding_status = 'pending', embedding_error = NULL",
+                [content_id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_imported_image_types(&mut self, selections: &[(Uuid, ImageType)]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        for (id, kind) in selections {
+            let changed = transaction.execute("UPDATE meme_contents SET image_type=?1,image_type_source='imported',image_review_status='confirmed',semantic_status='pending',semantic_error=NULL,semantic_embedding_provider=NULL,semantic_embedding_model=NULL,semantic_embedding_dimension=NULL,semantic_embedding=NULL,semantic_text_hash=NULL WHERE id=?2 AND kind IN ('image','motion') AND image_type_source='unknown'", params![kind.as_database_str(),id.to_string()])?;
+            if changed == 1 {
+                transaction.execute("INSERT INTO image_semantic_state(content_id,requested,embedding_status) SELECT id,1,'pending' FROM meme_contents WHERE id=?1 AND kind IN ('image','motion') ON CONFLICT(content_id) DO UPDATE SET requested=1", [id.to_string()])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn get_image_semantics(&self, content_id: Uuid) -> Result<ImageSemantics> {
+        let history = self.connection.prepare(
+            "SELECT from_category,to_category,reason,status,at FROM image_category_history WHERE content_id=?1 ORDER BY id"
+        )?.query_map([content_id.to_string()], |row| Ok(crate::CategoryReclassification {
+            from_category: row.get(0)?,
+            to_category: row.get(1)?,
+            reason: row.get(2)?,
+            status: row.get(3)?,
+            at: row.get(4)?,
+        }))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT meme_id, relative_path, image_type, image_type_source, image_review_status, semantic_caption,
+                    semantic_tags, visible_text, semantic_status, semantic_error,
+                    semantic_prompt_version, semantic_embedding_provider,
+                    semantic_embedding_model, semantic_embedding_dimension, semantic_text_hash,
+                    s.category_fit, s.category_review_reason, s.suggested_category,
+                    COALESCE(s.provenance, 'automatic'), COALESCE(s.embedding_status, 'pending'),
+                    s.embedding_error, COALESCE(s.index_version, 1), s.built_at
+             FROM meme_contents c LEFT JOIN image_semantic_state s ON s.content_id = c.id
+             WHERE c.id = ?1 AND kind IN ('image', 'motion')",
+                [content_id.to_string()],
+                |row| {
+                    let tags = row
+                        .get::<_, Option<String>>(6)?
+                        .unwrap_or_else(|| "[]".to_owned());
+                    let tags = serde_json::from_str(&tags).unwrap_or_default();
+                    Ok(ImageSemantics {
+                        content_id,
+                        meme_id: uuid_from_column(row, 0)?,
+                        relative_path: PathBuf::from(row.get::<_, String>(1)?),
+                        image_type: ImageType::from_database_str(&row.get::<_, String>(2)?),
+                        image_type_source: row.get(3)?,
+                        image_review_status: row.get(4)?,
+                        caption: row.get(5)?,
+                        semantic_tags: tags,
+                        visible_text: row.get(7)?,
+                        status: row.get(8)?,
+                        error: row.get(9)?,
+                        prompt_version: row.get(10)?,
+                        embedding_provider: row.get(11)?,
+                        embedding_model: row.get(12)?,
+                        embedding_dimension: row.get::<_, Option<i64>>(13)?.and_then(|value| usize::try_from(value).ok()),
+                        text_hash: row.get(14)?,
+                        category_fit: row.get(15)?,
+                        category_review_reason: row.get(16)?,
+                        suggested_category: row.get(17)?,
+                        provenance: row.get(18)?,
+                        embedding_status: row.get(19)?,
+                        embedding_error: row.get(20)?,
+                        index_version: row.get(21)?,
+                        built_at: row.get(22)?,
+                        reclassification_history: history.clone(),
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::InvalidDatabase(format!("image content {content_id} was not found"))
+            });
+        row
+    }
+
+    pub fn list_images_needing_review(&self) -> Result<Vec<ImageSemantics>> {
+        let ids = self
+            .connection
+            .prepare("SELECT id FROM meme_contents WHERE kind IN ('image', 'motion') AND image_review_status = 'needs_review' ORDER BY rowid DESC")?
+            .query_map([], |row| uuid_from_column(row, 0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .filter_map(|id| match self.get_image_semantics(id) {
+                Ok(semantics)
+                    if self
+                        .resolve_media_path(&semantics.relative_path)
+                        .ok()
+                        .is_some_and(|path| path.is_file()) =>
+                {
+                    Some(Ok(semantics))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    pub fn list_images_pending_semantics(&self) -> Result<Vec<ImageSemantics>> {
+        let ids = self
+            .connection
+            .prepare("SELECT id FROM meme_contents WHERE kind IN ('image', 'motion') AND semantic_status IN ('pending', 'failed') ORDER BY rowid DESC")?
+            .query_map([], |row| uuid_from_column(row, 0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.get_image_semantics(id))
+            .collect()
+    }
+
+    pub fn semantic_index_needs_rebuild(
+        &self,
+        semantics: &ImageSemantics,
+        provider: &str,
+        model: &str,
+        dimension: usize,
+        prompt_version: &str,
+        text_hash: &str,
+    ) -> bool {
+        semantics.status != "done"
+            || semantics.embedding_status != "done"
+            || semantics.index_version != 1
+            || semantics.prompt_version.as_deref() != Some(prompt_version)
+            || semantics.embedding_provider.as_deref() != Some(provider)
+            || semantics.embedding_model.as_deref() != Some(model)
+            || semantics.embedding_dimension != Some(dimension)
+            || semantics.text_hash.as_deref() != Some(text_hash)
+    }
+
+    pub fn resolve_image_review(&mut self, content_id: Uuid, image_type: ImageType) -> Result<()> {
+        self.set_manual_image_types(&[(content_id, image_type)])
+    }
+
+    pub fn begin_image_semantics(&self, content_id: Uuid) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE meme_contents SET semantic_status = 'running', semantic_error = NULL
+             WHERE id = ?1 AND kind IN ('image', 'motion') AND semantic_status <> 'running'
+             AND NOT EXISTS (SELECT 1 FROM image_semantic_state s WHERE s.content_id=meme_contents.id AND s.provenance='manual')",
+            [content_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidDatabase(format!(
+                "image content {content_id} was not found or is already running"
+            )));
+        }
+        transaction.execute("INSERT INTO image_semantic_state(content_id,requested) VALUES (?1,1) ON CONFLICT(content_id) DO UPDATE SET requested=1", [content_id.to_string()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn request_image_semantics(&mut self, ids: &[Uuid]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        for id in ids {
+            transaction.execute("INSERT INTO image_semantic_state(content_id,requested) SELECT id,1 FROM meme_contents WHERE id=?1 AND kind IN ('image','motion') ON CONFLICT(content_id) DO UPDATE SET requested=1", [id.to_string()])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn requested_image_semantics(&self) -> Result<Vec<Uuid>> {
+        self.connection.prepare("SELECT c.id FROM meme_contents c JOIN image_semantic_state s ON s.content_id=c.id WHERE s.requested=1 AND s.provenance<>'manual' AND c.semantic_status='pending' ORDER BY c.rowid")?
+            .query_map([], |row| uuid_from_column(row,0))?
+            .collect::<std::result::Result<Vec<_>,_>>().map_err(Error::from)
+    }
+
+    pub fn fail_image_semantics(&self, content_id: Uuid, error: &str) -> Result<()> {
+        // A late network failure does not invalidate a newer user edit or completed result.
+        let current = self.get_image_semantics(content_id)?;
+        if current.provenance == "manual" || current.status == "done" {
+            return Ok(());
+        }
+        let changed = self.connection.execute(
+            "UPDATE meme_contents SET semantic_status = 'failed', semantic_error = ?1
+             WHERE id = ?2 AND kind IN ('image', 'motion') AND semantic_status <> 'done'
+             AND NOT EXISTS (SELECT 1 FROM image_semantic_state s WHERE s.content_id=meme_contents.id AND s.provenance='manual')",
+            params![error, content_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidDatabase(format!(
+                "image content {content_id} was not found"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn embed_image_semantics(
+        &mut self,
+        content_id: Uuid,
+        caption: &str,
+        tags: &[String],
+        visible_text: &str,
+        image_type: ImageType,
+    ) -> Result<()> {
+        let current = self.get_image_semantics(content_id)?;
+        let text = crate::semantic::build_semantic_text(
+            caption,
+            tags,
+            visible_text,
+            image_type.as_database_str(),
+        );
+        let persisted_text = crate::semantic::build_semantic_text(
+            current.caption.as_deref().unwrap_or(""),
+            &current.semantic_tags,
+            current.visible_text.as_deref().unwrap_or(""),
+            current.image_type.as_database_str(),
+        );
+        if current.status != "done"
+            || current.caption.as_deref().unwrap_or("").trim().is_empty()
+            || current.semantic_tags.is_empty()
+            || text != persisted_text
+        {
+            return Err(Error::InvalidDatabase(
+                "embedding input does not match completed semantics".to_owned(),
+            ));
+        }
+        let vector = self
+            .embedding_provider
+            .embed_text(&text)
+            .map_err(Error::EmbeddingProvider)?;
+        let encoded = encode_embedding("semantic embedding", vector, self.embedding_dimension)?;
+        let hash = sha256_bytes(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        // Readers must never observe a new vector with the previous build state.
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE meme_contents SET semantic_embedding_provider = ?1,
+             semantic_embedding_model = ?2, semantic_embedding_dimension = ?3,
+             semantic_embedding = ?4, semantic_text_hash = ?5
+             WHERE id = ?6 AND kind IN ('image', 'motion') AND semantic_status='done'
+             AND semantic_caption=?7 AND COALESCE(visible_text,'')=?8
+             AND image_type=?9 AND semantic_tags=?10",
+            params![
+                "clip",
+                self.embedding_provider.model_id(),
+                usize_to_i64(self.embedding_dimension, "semantic embedding dimension")?,
+                encoded,
+                hash,
+                content_id.to_string(),
+                current.caption,
+                current.visible_text.as_deref().unwrap_or(""),
+                current.image_type.as_database_str(),
+                serde_json::to_string(&current.semantic_tags)
+                    .map_err(|error| Error::InvalidDatabase(error.to_string()))?,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(Error::InvalidDatabase(format!(
+                "image content {content_id} was removed or changed during embedding"
+            )));
+        }
+        transaction.execute("INSERT INTO image_semantic_state(content_id,embedding_status,built_at) VALUES (?1,'done',strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(content_id) DO UPDATE SET embedding_status='done',embedding_error=NULL,index_version=1,built_at=excluded.built_at", [content_id.to_string()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn apply_vlm_semantics(
+        &mut self,
+        content_id: Uuid,
+        image_type: ImageType,
+        image_type_source: &str,
+        image_review_status: &str,
+        caption: &str,
+        tags: &[String],
+        visible_text: &str,
+    ) -> Result<()> {
+        self.save_vlm_semantics(
+            content_id,
+            image_type,
+            image_type_source,
+            image_review_status,
+            caption,
+            tags,
+            visible_text,
+            None,
+        )?;
+        self.rebuild_image_semantics(content_id)
+    }
+
+    pub fn save_vlm_semantics(
+        &mut self,
+        content_id: Uuid,
+        mut image_type: ImageType,
+        mut image_type_source: &str,
+        mut image_review_status: &str,
+        caption: &str,
+        tags: &[String],
+        visible_text: &str,
+        review: Option<(&str, &str, &str)>,
+    ) -> Result<()> {
+        // Lock before checking provenance so other connections cannot insert a manual edit
+        // between the automatic result's ownership check and its write.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let provenance: Option<String> = transaction
+            .query_row(
+                "SELECT provenance FROM image_semantic_state WHERE content_id=?1",
+                [content_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if provenance.as_deref() == Some("manual") {
+            return Ok(());
+        }
+        if review.is_some_and(|(fit, _, _)| !matches!(fit, "match" | "uncertain" | "conflict")) {
+            return Err(Error::InvalidDatabase("invalid category fit".to_owned()));
+        }
+        if caption.trim().is_empty() {
+            return Err(Error::InvalidDatabase(
+                "semantic caption cannot be empty".to_owned(),
+            ));
+        }
+        if !tags.iter().any(|tag| !tag.trim().is_empty()) {
+            return Err(Error::InvalidDatabase(
+                "semantic tags cannot be empty".to_owned(),
+            ));
+        }
+        if !matches!(
+            image_type_source,
+            "unknown" | "manual" | "automatic" | "imported"
+        ) {
+            return Err(Error::InvalidDatabase(
+                "invalid image type source".to_owned(),
+            ));
+        }
+        if !matches!(
+            image_review_status,
+            "unchecked" | "confirmed" | "needs_review"
+        ) {
+            return Err(Error::InvalidDatabase(
+                "invalid image review status".to_owned(),
+            ));
+        }
+        let (original_type, original_source): (String, String) = transaction
+            .query_row(
+                "SELECT image_type,image_type_source FROM meme_contents WHERE id = ?1 AND kind IN ('image', 'motion')",
+                [content_id.to_string()],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+        let mut transition = None;
+        if original_source == "manual" {
+            // A user may correct the type while the network request is in flight.
+            image_type = ImageType::from_database_str(&original_type);
+            image_type_source = "manual";
+            image_review_status = "confirmed";
+        } else if let Some(("conflict", reason, suggested)) = review {
+            image_type = match suggested {
+                "sticker" | "illustration" if suggested != original_type => {
+                    ImageType::from_database_str(suggested)
+                }
+                _ => ImageType::Unknown,
+            };
+            image_type_source = "automatic";
+            image_review_status = "needs_review";
+            if image_type.as_database_str() != original_type {
+                let status = if image_type == ImageType::Unknown {
+                    "moved_to_review"
+                } else {
+                    "auto_reclassified"
+                };
+                let reason = if reason.trim().is_empty() {
+                    "图片与原分类明显不符"
+                } else {
+                    reason.trim()
+                };
+                transition = Some((status, reason));
+            }
+        } else if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM image_category_history WHERE content_id=?1)",
+            [content_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )? {
+            image_review_status = "needs_review";
+        }
+        // OCR remains useful even if the embedding provider fails after this transaction.
+        let changed = transaction.execute(
+            "UPDATE meme_contents SET image_type = ?1, image_type_source = ?2,
+             image_review_status = ?3, semantic_caption = ?4, semantic_tags = ?5,
+             visible_text = ?6, semantic_status = 'done', semantic_error = NULL,
+             semantic_prompt_version = ?7,
+             semantic_embedding_provider = NULL, semantic_embedding_model = NULL,
+             semantic_embedding_dimension = NULL, semantic_embedding = NULL,
+             semantic_text_hash = NULL WHERE id = ?8 AND kind IN ('image', 'motion')",
+            params![
+                image_type.as_database_str(),
+                image_type_source,
+                image_review_status,
+                caption.trim(),
+                serde_json::to_string(tags)
+                    .map_err(|error| Error::InvalidDatabase(error.to_string()))?,
+                visible_text.trim(),
+                crate::semantic::CAPTION_PROMPT_VERSION,
+                content_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidDatabase(format!(
+                "image content {content_id} was not found"
+            )));
+        }
+        let (fit, reason, suggested) = review
+            .map(|(fit, reason, suggested)| {
+                let suggested = if fit == "conflict"
+                    && matches!(suggested, "sticker" | "illustration")
+                    && suggested != original_type
+                {
+                    suggested
+                } else {
+                    ""
+                };
+                (Some(fit), Some(reason), Some(suggested))
+            })
+            .unwrap_or_default();
+        transaction.execute(
+            "INSERT INTO image_semantic_state(content_id,category_fit,category_review_reason,suggested_category,embedding_status)
+             VALUES (?1,?2,?3,?4,'pending') ON CONFLICT(content_id) DO UPDATE SET
+             category_fit=excluded.category_fit, category_review_reason=excluded.category_review_reason,
+             suggested_category=excluded.suggested_category, embedding_status='pending', embedding_error=NULL, requested=0",
+            params![content_id.to_string(), fit, reason, suggested],
+        )?;
+        if let Some((status, reason)) = transition {
+            transaction.execute(
+                "INSERT INTO image_category_history(content_id,from_category,to_category,reason,status,at)
+                 VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                params![content_id.to_string(),original_type,image_type.as_database_str(),reason,status],
+            )?;
+            transaction.execute(
+                "DELETE FROM image_category_history WHERE content_id=?1 AND id NOT IN
+                 (SELECT id FROM image_category_history WHERE content_id=?1 ORDER BY id DESC LIMIT 20)",
+                [content_id.to_string()],
+            )?;
+            let review_reason = format!(
+                "已从 {original_type} 自动移至 {}：{reason}",
+                image_type.as_database_str()
+            )
+            .chars()
+            .take(500)
+            .collect::<String>();
+            transaction.execute(
+                "UPDATE image_semantic_state SET category_fit='uncertain',category_review_reason=?1,suggested_category=?2 WHERE content_id=?3",
+                params![review_reason, if image_type == ImageType::Unknown { "" } else { image_type.as_database_str() }, content_id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn edit_image_semantics(
+        &mut self,
+        content_id: Uuid,
+        image_type: ImageType,
+        caption: &str,
+        tags: &[String],
+        visible_text: &str,
+    ) -> Result<()> {
+        if caption.trim().is_empty() || !tags.iter().any(|tag| !tag.trim().is_empty()) {
+            return Err(Error::InvalidDatabase(
+                "caption and tags cannot be empty".to_owned(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE meme_contents SET image_type=?1,image_type_source='manual',image_review_status='confirmed',
+             semantic_caption=?2,semantic_tags=?3,visible_text=?4,semantic_status='done',semantic_error=NULL,
+             semantic_embedding=NULL,semantic_text_hash=NULL
+             WHERE id=?5 AND kind IN ('image','motion')",
+            params![image_type.as_database_str(),caption.trim(),serde_json::to_string(tags).map_err(|e| Error::InvalidDatabase(e.to_string()))?,visible_text.trim(),content_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidDatabase("image content not found".to_owned()));
+        }
+        transaction.execute(
+            "INSERT INTO image_semantic_state(content_id,provenance) VALUES (?1,'manual')
+             ON CONFLICT(content_id) DO UPDATE SET provenance='manual',embedding_status='pending',embedding_error=NULL,requested=0",
+            [content_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn rebuild_image_semantics(&mut self, content_id: Uuid) -> Result<()> {
+        let current = self.get_image_semantics(content_id)?;
+        if current.status != "done"
+            || current.caption.as_deref().unwrap_or("").is_empty()
+            || current.semantic_tags.is_empty()
+        {
+            return Err(Error::InvalidDatabase(
+                "semantic caption is not ready".to_owned(),
+            ));
+        }
+        self.connection.execute("INSERT INTO image_semantic_state(content_id,embedding_status) VALUES (?1,'running') ON CONFLICT(content_id) DO UPDATE SET embedding_status='running',embedding_error=NULL", [content_id.to_string()])?;
+        let result = self.embed_image_semantics(
+            content_id,
+            current.caption.as_deref().unwrap(),
+            &current.semantic_tags,
+            current.visible_text.as_deref().unwrap_or(""),
+            current.image_type,
+        );
+        if let Err(error) = &result {
+            self.connection.execute("UPDATE image_semantic_state SET embedding_status='failed',embedding_error=?1 WHERE content_id=?2 AND embedding_status='running'", params![error.to_string(),content_id.to_string()])?;
+        }
+        result
+    }
+
+    pub fn list_image_semantics(&self, pack_id: Option<Uuid>) -> Result<Vec<ImageSemantics>> {
+        let ids = self.connection.prepare("SELECT c.id FROM meme_contents c JOIN memes m ON m.id=c.meme_id WHERE c.kind IN ('image','motion') AND (?1 IS NULL OR m.meme_pack_id=?1) ORDER BY c.rowid DESC")?
+            .query_map([pack_id.map(|id| id.to_string())], |r| uuid_from_column(r,0))?
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        ids.into_iter()
+            .map(|id| self.get_image_semantics(id))
+            .collect()
+    }
+
+    pub fn rebuild_pending_semantics(&mut self) -> Result<usize> {
+        let ids = self.list_stale_semantic_indexes()?;
+        let mut rebuilt = 0;
+        let mut failures = Vec::new();
+        for id in ids {
+            match self.rebuild_image_semantics(id) {
+                Ok(()) => rebuilt += 1,
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(rebuilt)
+        } else {
+            Err(Error::InvalidDatabase(format!(
+                "rebuilt {rebuilt} semantic vectors; {} failed: {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    pub fn list_stale_semantic_indexes(&self) -> Result<Vec<Uuid>> {
+        let mut ids = Vec::new();
+        for item in self.list_image_semantics(None)? {
+            if item.status != "done" {
+                continue;
+            }
+            let text = crate::semantic::build_semantic_text(
+                item.caption.as_deref().unwrap_or(""),
+                &item.semantic_tags,
+                item.visible_text.as_deref().unwrap_or(""),
+                item.image_type.as_database_str(),
+            );
+            let hash = sha256_bytes(text.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if item.embedding_status != "done"
+                || item.embedding_provider.as_deref() != Some("clip")
+                || item.embedding_model.as_deref() != Some(self.embedding_provider.model_id())
+                || item.embedding_dimension != Some(self.embedding_dimension)
+                || item.text_hash.as_deref() != Some(&hash)
+                || item.index_version != 1
+            {
+                ids.push(item.content_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn update_image_semantics(
+        &mut self,
+        content_id: Uuid,
+        mut update: UpdateImageSemantics,
+    ) -> Result<()> {
+        let manual_content = update.image_type_source == "manual";
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let provenance: Option<String> = transaction
+            .query_row(
+                "SELECT provenance FROM image_semantic_state WHERE content_id=?1",
+                [content_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if provenance.as_deref() == Some("manual") && !manual_content {
+            return Ok(());
+        }
+        if !matches!(
+            update.image_type_source.as_str(),
+            "unknown" | "manual" | "automatic" | "imported"
+        ) {
+            return Err(Error::InvalidDatabase(
+                "invalid image type source".to_owned(),
+            ));
+        }
+        if !matches!(
+            update.image_review_status.as_str(),
+            "unchecked" | "confirmed" | "needs_review"
+        ) {
+            return Err(Error::InvalidDatabase(
+                "invalid image review status".to_owned(),
+            ));
+        }
+        if !matches!(
+            update.status.as_str(),
+            "pending" | "running" | "done" | "failed"
+        ) {
+            return Err(Error::InvalidDatabase("invalid semantic status".to_owned()));
+        }
+        let current = transaction.query_row(
+            "SELECT image_type, image_type_source FROM meme_contents WHERE id = ?1 AND kind IN ('image', 'motion')",
+            [content_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()?;
+        if let Some((current_type, source)) = current {
+            if source == "manual" && update.image_type_source != "manual" {
+                // A result generated before a manual correction must not restore the old category or vector.
+                if current_type != update.image_type.as_database_str() {
+                    return Err(Error::InvalidDatabase(
+                        "automatic semantics conflict with the manual image type".to_owned(),
+                    ));
+                }
+                update.image_type_source = "manual".to_owned();
+                update.image_review_status = "confirmed".to_owned();
+            }
+        }
+        let image_type = update.image_type.as_database_str();
+        let text = crate::semantic::build_semantic_text(
+            update.caption.as_deref().unwrap_or(""),
+            &update.semantic_tags,
+            update.visible_text.as_deref().unwrap_or(""),
+            image_type,
+        );
+        let hash = sha256_bytes(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let valid_embedding = update.status == "done"
+            && update
+                .caption
+                .as_deref()
+                .is_some_and(|caption| !caption.trim().is_empty())
+            && update
+                .semantic_tags
+                .iter()
+                .any(|tag| !tag.trim().is_empty())
+            && update.text_hash.as_deref() == Some(hash.as_str())
+            && update.embedding_provider.as_deref() == Some("clip")
+            && update.embedding_model.as_deref() == Some(self.embedding_provider.model_id())
+            && update.embedding_dimension == Some(self.embedding_dimension)
+            && update.embedding.as_ref().is_some_and(|bytes| {
+                bytes.len() == self.embedding_dimension * size_of::<f32>()
+                    && encode_embedding(
+                        "semantic embedding",
+                        bytes
+                            .chunks_exact(4)
+                            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                            .collect(),
+                        self.embedding_dimension,
+                    )
+                    .is_ok()
+            });
+        if !valid_embedding {
+            update.embedding = None;
+            update.text_hash = None;
+            update.embedding_provider = None;
+            update.embedding_model = None;
+            update.embedding_dimension = None;
+        }
+        let provenance = if manual_content {
+            "manual"
+        } else {
+            "automatic"
+        };
+        let dimension = update
+            .embedding_dimension
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    Error::InvalidDatabase("embedding dimension is too large".to_owned())
+                })
+            })
+            .transpose()?;
+        let changed = transaction.execute(
+            "UPDATE meme_contents SET image_type = ?1, image_type_source = ?2,
+             image_review_status = ?3, semantic_caption = ?4, semantic_tags = ?5,
+             visible_text = ?6, semantic_status = ?7, semantic_error = ?8,
+             semantic_prompt_version = ?9, semantic_text_hash = ?10,
+             semantic_embedding_provider = ?11, semantic_embedding_model = ?12,
+             semantic_embedding_dimension = ?13, semantic_embedding = ?14
+             WHERE id = ?15 AND kind IN ('image', 'motion')",
+            params![
+                image_type,
+                update.image_type_source,
+                update.image_review_status,
+                update.caption,
+                serde_json::to_string(&update.semantic_tags)
+                    .map_err(|error| Error::InvalidDatabase(error.to_string()))?,
+                update.visible_text,
+                update.status,
+                update.error,
+                update.prompt_version,
+                update.text_hash,
+                update.embedding_provider,
+                update.embedding_model,
+                dimension,
+                update.embedding,
+                content_id.to_string(),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(Error::InvalidDatabase(format!(
+                "image content {content_id} was not found"
+            )));
+        }
+        transaction.execute("INSERT INTO image_semantic_state(content_id,provenance,embedding_status,built_at) VALUES (?1,?2,?3,CASE WHEN ?3='done' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END) ON CONFLICT(content_id) DO UPDATE SET provenance=excluded.provenance,embedding_status=excluded.embedding_status,embedding_error=NULL,built_at=excluded.built_at", params![content_id.to_string(),provenance,if valid_embedding { "done" } else { "pending" }])?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn resolve_media_path(&self, relative_path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -104,6 +859,20 @@ impl MemeDatabase {
         relative_path: impl AsRef<Path>,
     ) -> Result<PathBuf> {
         resolve_media_path(storage_root.as_ref(), relative_path.as_ref())
+    }
+
+    /// Returns the visual asset appropriate for VLM input. Motion items use their
+    /// generated preview when available; callers still receive the original path
+    /// for formats without a preview so the VLM layer can reject them explicitly.
+    pub fn semantic_media_path(&self, content_id: Uuid) -> Result<PathBuf> {
+        let relative: String = self.connection.query_row(
+            "SELECT CASE WHEN kind='motion' AND preview_relative_path IS NOT NULL
+                    THEN preview_relative_path ELSE relative_path END
+             FROM meme_contents WHERE id=?1 AND kind IN ('image','motion')",
+            [content_id.to_string()],
+            |row| row.get(0),
+        )?;
+        self.resolve_media_path(relative)
     }
 
     pub fn find_similar_images(
@@ -265,6 +1034,67 @@ impl MemeDatabase {
                 .similarity
                 .total_cmp(&left.similarity)
                 .then_with(|| left.meme_id.cmp(&right.meme_id))
+        });
+        if limit > 0 {
+            matches.truncate(limit);
+        }
+        Ok(matches)
+    }
+
+    pub fn search_vlm_semantics(
+        &mut self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::SemanticMemeMatch>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let vector = self
+            .embedding_provider
+            .embed_text(query.trim())
+            .map_err(Error::EmbeddingProvider)?;
+        let query_embedding =
+            encode_embedding("VLM semantic query", vector, self.embedding_dimension)?;
+        let mut statement = self.connection.prepare(
+            "SELECT meme_id, semantic_embedding FROM meme_contents c JOIN image_semantic_state s ON s.content_id=c.id
+             WHERE semantic_status = 'done' AND semantic_embedding IS NOT NULL
+             AND s.embedding_status='done' AND s.index_version=1
+             AND semantic_embedding_provider = 'clip' AND semantic_embedding_model = ?1
+             AND semantic_embedding_dimension = ?2 AND semantic_text_hash IS NOT NULL",
+        )?;
+        let rows = statement.query_map(
+            params![
+                self.embedding_provider.model_id(),
+                self.embedding_dimension as i64
+            ],
+            |row| Ok((uuid_from_column(row, 0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        let mut scores = HashMap::<Uuid, f32>::new();
+        for row in rows {
+            let (meme_id, embedding) = row?;
+            let similarity = cosine_similarity_between_encoded_embeddings(
+                &query_embedding,
+                &embedding,
+                self.embedding_dimension,
+            )?;
+            if similarity >= SEMANTIC_MIN_SIMILARITY {
+                scores
+                    .entry(meme_id)
+                    .and_modify(|score| *score = score.max(similarity))
+                    .or_insert(similarity);
+            }
+        }
+        let mut matches = scores
+            .into_iter()
+            .map(|(meme_id, similarity)| crate::SemanticMemeMatch {
+                meme_id,
+                similarity,
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| {
+            b.similarity
+                .total_cmp(&a.similarity)
+                .then_with(|| a.meme_id.cmp(&b.meme_id))
         });
         if limit > 0 {
             matches.truncate(limit);
@@ -967,7 +1797,8 @@ impl MemeDatabase {
         let mut statement = self.connection.prepare(
             "SELECT m.id, m.meme_pack_id, m.name, m.description,
                     c.id, c.kind, c.text, c.relative_path, c.preview_relative_path,
-                    c.width, c.height, c.byte_size, c.image_format, c.motion_format
+                    c.width, c.height, c.byte_size, c.image_format, c.motion_format,
+                    c.image_type, c.visible_text
              FROM (SELECT id, meme_pack_id, name, description, rowid
                    FROM memes ORDER BY rowid DESC LIMIT ?1 OFFSET ?2) m
              JOIN meme_contents c ON c.meme_id = m.id
@@ -996,6 +1827,8 @@ impl MemeDatabase {
                 byte_size: row.get(11)?,
                 image_format: row.get(12)?,
                 motion_format: row.get(13)?,
+                image_type: row.get(14)?,
+                visible_text: row.get(15)?,
             });
             Ok(())
         })?;
@@ -1686,7 +2519,7 @@ impl MemeDatabase {
         let rows = {
             let mut statement = self.connection.prepare(
                 "SELECT id, kind, text, relative_path, preview_relative_path, width, height,
-                        byte_size, image_format, motion_format
+                        byte_size, image_format, motion_format, image_type, visible_text
                  FROM meme_contents
                  WHERE meme_id = ?1
                  ORDER BY position",
@@ -1704,6 +2537,8 @@ impl MemeDatabase {
                         byte_size: row.get(7)?,
                         image_format: row.get(8)?,
                         motion_format: row.get(9)?,
+                        image_type: row.get(10)?,
+                        visible_text: row.get(11)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -1863,7 +2698,26 @@ fn initialize_database(
 ) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
-        0 => create_schema(connection, model_id, embedding_dimension),
+        0 => {
+            create_schema(connection, model_id, embedding_dimension)?;
+            migrate_schema_v2_to_v3(connection)?;
+            migrate_schema_v3_to_v4(connection)
+        }
+        1 => {
+            migrate_schema_v1_to_v2(connection)?;
+            migrate_schema_v2_to_v3(connection)?;
+            migrate_schema_v3_to_v4(connection)?;
+            validate_database_metadata(connection, model_id, embedding_dimension)
+        }
+        2 => {
+            migrate_schema_v2_to_v3(connection)?;
+            migrate_schema_v3_to_v4(connection)?;
+            validate_database_metadata(connection, model_id, embedding_dimension)
+        }
+        3 => {
+            migrate_schema_v3_to_v4(connection)?;
+            validate_database_metadata(connection, model_id, embedding_dimension)
+        }
         SCHEMA_VERSION => validate_database_metadata(connection, model_id, embedding_dimension),
         actual => Err(Error::UnsupportedSchemaVersion {
             expected: SCHEMA_VERSION,
@@ -1938,6 +2792,20 @@ fn create_schema(
             motion_format TEXT CHECK(motion_format IN ('mp4', 'webm', 'tgs')),
             content_hash BLOB NOT NULL CHECK(length(content_hash) = {CONTENT_HASH_BYTES}),
             embedding BLOB CHECK(embedding IS NULL OR length(embedding) = {embedding_bytes}),
+            image_type TEXT NOT NULL DEFAULT 'unknown' CHECK(image_type IN ('unknown', 'sticker', 'illustration')),
+            image_type_source TEXT NOT NULL DEFAULT 'unknown' CHECK(image_type_source IN ('unknown', 'manual', 'automatic', 'imported')),
+            image_review_status TEXT NOT NULL DEFAULT 'unchecked' CHECK(image_review_status IN ('unchecked', 'confirmed', 'needs_review')),
+            semantic_caption TEXT,
+            semantic_tags TEXT,
+            visible_text TEXT,
+            semantic_status TEXT NOT NULL DEFAULT 'pending' CHECK(semantic_status IN ('pending', 'running', 'done', 'failed')),
+            semantic_error TEXT,
+            semantic_prompt_version TEXT,
+            semantic_text_hash TEXT,
+            semantic_embedding_provider TEXT,
+            semantic_embedding_model TEXT,
+            semantic_embedding_dimension INTEGER,
+            semantic_embedding BLOB,
             UNIQUE(meme_id, position),
             CHECK(
                 (kind = 'text' AND text IS NOT NULL AND trim(text) <> '' AND
@@ -2022,12 +2890,93 @@ fn create_schema(
         "INSERT INTO metadata(singleton, schema_version, embedding_model_id, embedding_dimension)
          VALUES (1, ?1, ?2, ?3)",
         params![
-            SCHEMA_VERSION,
+            2,
             model_id,
             usize_to_i64(embedding_dimension, "embedding dimension")?
         ],
     )?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_schema_v1_to_v2(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let existing = transaction
+        .prepare("PRAGMA table_info(meme_contents)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+    let columns = [
+        ("image_type", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("image_type_source", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("image_review_status", "TEXT NOT NULL DEFAULT 'unchecked'"),
+        ("semantic_caption", "TEXT"),
+        ("semantic_tags", "TEXT"),
+        ("visible_text", "TEXT"),
+        ("semantic_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("semantic_error", "TEXT"),
+        ("semantic_prompt_version", "TEXT"),
+        ("semantic_text_hash", "TEXT"),
+        ("semantic_embedding_provider", "TEXT"),
+        ("semantic_embedding_model", "TEXT"),
+        ("semantic_embedding_dimension", "INTEGER"),
+        ("semantic_embedding", "BLOB"),
+    ];
+    for (name, definition) in columns {
+        if !existing.contains(name) {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE meme_contents ADD COLUMN {name} {definition};"
+            ))?;
+        }
+    }
+    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.execute("UPDATE metadata SET schema_version = 2", [])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_schema_v2_to_v3(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS image_semantic_state (
+            content_id TEXT PRIMARY KEY REFERENCES meme_contents(id) ON DELETE CASCADE,
+            category_fit TEXT CHECK(category_fit IN ('match', 'uncertain', 'conflict')),
+            category_review_reason TEXT,
+            suggested_category TEXT,
+            provenance TEXT NOT NULL DEFAULT 'automatic' CHECK(provenance IN ('automatic', 'manual')),
+            embedding_status TEXT NOT NULL DEFAULT 'pending' CHECK(embedding_status IN ('pending', 'running', 'done', 'failed')),
+            embedding_error TEXT,
+            index_version INTEGER NOT NULL DEFAULT 1,
+            built_at TEXT,
+            requested INTEGER NOT NULL DEFAULT 0 CHECK(requested IN (0,1))
+        );
+        INSERT INTO image_semantic_state(content_id, embedding_status)
+        SELECT id, CASE WHEN semantic_embedding IS NOT NULL AND semantic_status = 'done' THEN 'done' ELSE 'pending' END
+        FROM meme_contents WHERE kind IN ('image', 'motion')
+        ON CONFLICT(content_id) DO NOTHING;"
+    )?;
+    transaction.pragma_update(None, "user_version", 3)?;
+    transaction.execute("UPDATE metadata SET schema_version = 3", [])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_schema_v3_to_v4(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS image_category_history (
+            id INTEGER PRIMARY KEY,
+            content_id TEXT NOT NULL REFERENCES meme_contents(id) ON DELETE CASCADE,
+            from_category TEXT NOT NULL,
+            to_category TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('auto_reclassified','moved_to_review')),
+            at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS image_category_history_content ON image_category_history(content_id,id);",
+    )?;
+    transaction.pragma_update(None, "user_version", 4)?;
+    transaction.execute("UPDATE metadata SET schema_version = 4", [])?;
     transaction.commit()?;
     Ok(())
 }
@@ -2677,6 +3626,8 @@ impl RawCollectorItem {
             byte_size: self.byte_size,
             image_format: self.image_format,
             motion_format: self.motion_format,
+            image_type: Some("unknown".to_owned()),
+            visible_text: None,
         }
         .into_domain(storage_root)?;
         let content = match content {
@@ -2728,6 +3679,8 @@ fn collector_item_into_meme_content(item: CollectorItem) -> MemeContent {
             height,
             byte_size,
             format,
+            image_type: ImageType::Unknown,
+            visible_text: None,
         }),
         CollectorContent::Motion {
             relative_path,
@@ -2744,6 +3697,8 @@ fn collector_item_into_meme_content(item: CollectorItem) -> MemeContent {
             height,
             byte_size,
             format,
+            image_type: ImageType::Unknown,
+            visible_text: None,
         }),
         CollectorContent::Text { text } => MemeContent::Text(MemeText { id: item.id, text }),
     }
@@ -2849,6 +3804,8 @@ struct RawContent {
     byte_size: Option<i64>,
     image_format: Option<String>,
     motion_format: Option<String>,
+    image_type: Option<String>,
+    visible_text: Option<String>,
 }
 
 impl RawContent {
@@ -2907,6 +3864,10 @@ impl RawContent {
                     height,
                     byte_size,
                     format,
+                    image_type: ImageType::from_database_str(
+                        self.image_type.as_deref().unwrap_or("unknown"),
+                    ),
+                    visible_text: self.visible_text,
                 }))
             }
             "motion" => {
@@ -2951,6 +3912,10 @@ impl RawContent {
                     height,
                     byte_size,
                     format,
+                    image_type: ImageType::from_database_str(
+                        self.image_type.as_deref().unwrap_or("unknown"),
+                    ),
+                    visible_text: self.visible_text,
                 }))
             }
             kind => Err(Error::InvalidDatabase(format!(

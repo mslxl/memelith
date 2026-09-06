@@ -4,15 +4,19 @@ mod database;
 mod embedding;
 mod error;
 mod model;
+pub mod semantic;
 
-pub use database::{COLLECTOR_DUPLICATE_MAX_COSINE_DISTANCE, MemeDatabase};
+pub use database::{
+    COLLECTOR_DUPLICATE_MAX_COSINE_DISTANCE, MemeDatabase, SEMANTIC_MIN_SIMILARITY,
+};
 pub use embedding::{EmbeddingProvider, EmbeddingProviderError};
 pub use error::{Error, Result};
 pub use model::{
-    CollectorContent, CollectorDuplicate, CollectorDuplicateSource, CollectorDuplicateTarget,
-    CollectorItem, EffectiveTag, ImageDuplicate, ImageFormat, Meme, MemeContent, MemeImage,
-    MemeMotion, MemePack, MemeText, MotionFormat, NewMeme, NewMemeContent, NewMemeFromCollector,
-    NewMemePack, NewTag, SemanticMemeMatch, SimilarMemeImage, Tag, UpdateMemeMetadata,
+    CategoryReclassification, CollectorContent, CollectorDuplicate, CollectorDuplicateSource,
+    CollectorDuplicateTarget, CollectorItem, EffectiveTag, ImageDuplicate, ImageFormat,
+    ImageSemantics, ImageType, Meme, MemeContent, MemeImage, MemeMotion, MemePack, MemeText,
+    MotionFormat, NewMeme, NewMemeContent, NewMemeFromCollector, NewMemePack, NewTag,
+    SemanticMemeMatch, SimilarMemeImage, Tag, UpdateImageSemantics, UpdateMemeMetadata,
     UpdateMemePack,
 };
 

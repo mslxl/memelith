@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use memelith_core::{Meme, MemeContent, Tag};
+use memelith_core::{Meme, MemeContent, SemanticMemeMatch, Tag};
 use nom::{
     IResult, Parser,
     branch::alt,
@@ -12,6 +12,7 @@ use nom::{
     sequence::{delimited, pair, terminated},
 };
 use regex::{Regex, RegexBuilder};
+use std::collections::HashSet;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 #[derive(Debug)]
@@ -37,6 +38,63 @@ impl Error for SearchError {}
 
 pub(crate) struct SearchExpression {
     root: Expression,
+}
+
+pub(crate) fn merge_semantic_results(
+    clip: Result<Vec<SemanticMemeMatch>, String>,
+    vlm: Result<Vec<SemanticMemeMatch>, String>,
+    limit: usize,
+) -> (Vec<SemanticMemeMatch>, Vec<String>) {
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+    // Each index is optional; a failed new index must not hide legacy CLIP hits.
+    for (name, result) in [("CLIP", clip), ("VLM", vlm)] {
+        match result {
+            Ok(results) => matches.extend(results),
+            Err(error) => errors.push(format!("{name}: {error}")),
+        }
+    }
+    matches.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then_with(|| a.meme_id.cmp(&b.meme_id))
+    });
+    let mut seen = HashSet::new();
+    matches.retain(|item| seen.insert(item.meme_id));
+    if limit > 0 {
+        matches.truncate(limit);
+    }
+    (matches, errors)
+}
+
+/// Combines independent structured and semantic matches while preserving the
+/// product ordering contract: structured matches first, semantic-only matches
+/// after them in similarity order.
+pub(crate) fn combine_match_indices(
+    structured: &[usize],
+    semantic: &[(usize, f32)],
+    structured_enabled: bool,
+    semantic_enabled: bool,
+) -> Vec<usize> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    if structured_enabled {
+        for &index in structured {
+            if seen.insert(index) {
+                result.push(index);
+            }
+        }
+    }
+    if semantic_enabled {
+        let mut ranked = semantic.to_vec();
+        ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+        for (index, _) in ranked {
+            if seen.insert(index) {
+                result.push(index);
+            }
+        }
+    }
+    result
 }
 
 impl SearchExpression {
@@ -274,7 +332,8 @@ impl SearchTerm {
 fn text_values(meme: &Meme) -> impl Iterator<Item = &str> {
     meme.contents.iter().filter_map(|content| match content {
         MemeContent::Text(text) => Some(text.text.as_str()),
-        MemeContent::Image(_) | MemeContent::Motion(_) => None,
+        MemeContent::Image(image) => image.visible_text.as_deref(),
+        MemeContent::Motion(motion) => motion.visible_text.as_deref(),
     })
 }
 
@@ -287,10 +346,14 @@ fn type_values(meme: &Meme) -> impl Iterator<Item = &'static str> + '_ {
 }
 
 fn content_values(meme: &Meme) -> impl Iterator<Item = &str> {
-    meme.contents.iter().map(|content| match content {
-        MemeContent::Image(_) => "image",
-        MemeContent::Motion(_) => "motion",
-        MemeContent::Text(text) => text.text.as_str(),
+    meme.contents.iter().flat_map(|content| {
+        match content {
+            MemeContent::Image(image) => [Some("image"), image.visible_text.as_deref()],
+            MemeContent::Motion(motion) => [Some("motion"), motion.visible_text.as_deref()],
+            MemeContent::Text(text) => [Some(text.text.as_str()), None],
+        }
+        .into_iter()
+        .flatten()
     })
 }
 
@@ -489,6 +552,84 @@ mod tests {
     use uuid::Uuid;
 
     use super::SearchExpression;
+    use super::combine_match_indices;
+
+    #[test]
+    fn semantic_indexes_fail_independently_and_keep_best_duplicate_score() {
+        let hit = |id, similarity| memelith_core::SemanticMemeMatch {
+            meme_id: Uuid::from_u128(id),
+            similarity,
+        };
+        for (clip, vlm) in [
+            (Ok(vec![hit(1, 0.8)]), Err("unavailable".to_owned())),
+            (Err("unavailable".to_owned()), Ok(vec![hit(1, 0.8)])),
+        ] {
+            let (matches, errors) = super::merge_semantic_results(clip, vlm, 48);
+            assert_eq!(matches, vec![hit(1, 0.8)]);
+            assert_eq!(errors.len(), 1);
+        }
+        let (matches, errors) = super::merge_semantic_results(
+            Ok(vec![hit(1, 0.6), hit(2, 0.8)]),
+            Ok(vec![hit(1, 0.9), hit(3, 0.7)]),
+            2,
+        );
+        assert_eq!(matches, vec![hit(1, 0.9), hit(2, 0.8)]);
+        assert!(errors.is_empty());
+        let (matches, errors) = super::merge_semantic_results(
+            Err("clip unavailable".to_owned()),
+            Err("vlm unavailable".to_owned()),
+            48,
+        );
+        assert!(matches.is_empty());
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn ocr_adds_content_text_without_replacing_legacy_image_marker() {
+        let mut meme = image_meme();
+        let MemeContent::Image(image) = &mut meme.contents[0] else {
+            unreachable!();
+        };
+        image.visible_text = Some("原文".to_owned());
+        for query in [
+            "content:image",
+            "content:=image",
+            "content:原文",
+            "text:原文",
+        ] {
+            assert!(matches(query, &meme, None), "{query}");
+        }
+        assert!(!matches("content:false", &meme, None));
+    }
+
+    #[test]
+    fn combines_structured_matches_before_semantic_only_matches() {
+        assert_eq!(
+            combine_match_indices(&[2, 1], &[(3, 0.9), (1, 0.99), (4, 0.8)], true, true),
+            vec![2, 1, 3, 4]
+        );
+        assert_eq!(
+            combine_match_indices(&[2], &[(3, 0.9)], false, true),
+            vec![3]
+        );
+        assert_eq!(
+            combine_match_indices(&[2], &[(3, 0.9)], true, false),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn semantic_order_is_preserved_after_structured_deduplication() {
+        assert_eq!(
+            combine_match_indices(
+                &[0, 2],
+                &[(4, 0.9), (2, 0.8), (1, 0.7), (0, 0.6)],
+                true,
+                true,
+            ),
+            vec![0, 2, 4, 1]
+        );
+    }
 
     fn text_meme() -> Meme {
         Meme {
@@ -510,6 +651,8 @@ mod tests {
             name: Some("Dog reaction".to_owned()),
             description: None,
             contents: vec![MemeContent::Image(MemeImage {
+                image_type: memelith_core::ImageType::Unknown,
+                visible_text: None,
                 id: Uuid::from_u128(200),
                 relative_path: PathBuf::from("dog.png"),
                 width: 640,
@@ -558,6 +701,31 @@ mod tests {
         assert!(matches("reaction 退退退", &meme, Some("Reaction Images")));
         assert!(!matches("猫 missing", &meme, Some("Reaction Images")));
         assert!(!matches("猫 退退退", &image_meme(), Some("Animals")));
+    }
+
+    #[test]
+    fn motion_ocr_is_searchable_without_changing_motion_type() {
+        let meme = Meme {
+            id: Uuid::from_u128(4),
+            meme_pack_id: Uuid::from_u128(40),
+            name: None,
+            description: None,
+            contents: vec![MemeContent::Motion(memelith_core::MemeMotion {
+                id: Uuid::from_u128(400),
+                relative_path: PathBuf::from("motion.mp4"),
+                preview_relative_path: Some(PathBuf::from("motion.png")),
+                width: 320,
+                height: 240,
+                byte_size: 1024,
+                format: memelith_core::MotionFormat::Mp4,
+                image_type: memelith_core::ImageType::Sticker,
+                visible_text: Some("动图原文".to_owned()),
+            })],
+        };
+        assert!(matches("text:动图原文", &meme, Some("Animations")));
+        assert!(matches("动图原文", &meme, Some("Animations")));
+        assert!(matches("content:动图原文", &meme, Some("Animations")));
+        assert!(matches("type:motion", &meme, Some("Animations")));
     }
 
     #[test]

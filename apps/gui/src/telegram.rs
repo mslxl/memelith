@@ -843,13 +843,20 @@ fn sync_sticker_set(
             skipped += 1;
             continue;
         }
-        database.create_meme(
+        let meme = database.create_meme(
             pack_id,
             NewMeme {
                 name: sticker.emoji.filter(|emoji| !emoji.trim().is_empty()),
                 description: None,
                 contents: vec![new_content],
             },
+        )?;
+        database.set_imported_image_types(
+            &meme
+                .contents
+                .iter()
+                .map(|content| (content.id(), memelith_core::ImageType::Sticker))
+                .collect::<Vec<_>>(),
         )?;
         added += 1;
     }

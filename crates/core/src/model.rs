@@ -45,6 +45,33 @@ pub struct MemeImage {
     pub height: u32,
     pub byte_size: u64,
     pub format: ImageFormat,
+    pub image_type: ImageType,
+    pub visible_text: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageType {
+    Unknown,
+    Sticker,
+    Illustration,
+}
+
+impl ImageType {
+    pub(crate) fn as_database_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Sticker => "sticker",
+            Self::Illustration => "illustration",
+        }
+    }
+
+    pub(crate) fn from_database_str(value: &str) -> Self {
+        match value {
+            "sticker" => Self::Sticker,
+            "illustration" => Self::Illustration,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +83,8 @@ pub struct MemeMotion {
     pub height: u32,
     pub byte_size: u64,
     pub format: MotionFormat,
+    pub image_type: ImageType,
+    pub visible_text: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +100,62 @@ pub struct SimilarMemeImage {
 pub struct SemanticMemeMatch {
     pub meme_id: Uuid,
     pub similarity: f32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateImageSemantics {
+    pub image_type: ImageType,
+    pub image_type_source: String,
+    pub image_review_status: String,
+    pub caption: Option<String>,
+    pub semantic_tags: Vec<String>,
+    pub visible_text: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub prompt_version: Option<String>,
+    pub text_hash: Option<String>,
+    pub embedding_provider: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_dimension: Option<usize>,
+    pub embedding: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryReclassification {
+    pub from_category: String,
+    pub to_category: String,
+    pub reason: String,
+    pub status: String,
+    pub at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageSemantics {
+    pub content_id: Uuid,
+    pub meme_id: Uuid,
+    pub relative_path: PathBuf,
+    pub image_type: ImageType,
+    pub image_type_source: String,
+    pub image_review_status: String,
+    pub caption: Option<String>,
+    pub semantic_tags: Vec<String>,
+    pub visible_text: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub prompt_version: Option<String>,
+    pub embedding_provider: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_dimension: Option<usize>,
+    pub text_hash: Option<String>,
+    pub category_fit: Option<String>,
+    pub category_review_reason: Option<String>,
+    pub suggested_category: Option<String>,
+    pub provenance: String,
+    pub embedding_status: String,
+    pub embedding_error: Option<String>,
+    pub index_version: i64,
+    pub built_at: Option<String>,
+    pub reclassification_history: Vec<CategoryReclassification>,
 }
 
 /// An image already present in the library that matches an incoming image.
