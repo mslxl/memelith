@@ -36,6 +36,7 @@
         buildInputs = [
           toolchain
           pkgs.pkg-config
+          pkgs.dav1d
           pkgs.diesel-cli
           pkgs.cargo-bundle
           pkgs.macdylibbundler

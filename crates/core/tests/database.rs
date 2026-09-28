@@ -75,7 +75,6 @@ fn migrates_actual_v1_schema_without_changing_legacy_data() {
             matches!(&saved.contents[1], MemeContent::Text(t) if t.id == text && t.text == "legacy text")
         );
         let semantics = database.get_image_semantics(image).unwrap();
-        assert!(database.requested_image_semantics().unwrap().is_empty());
         assert_eq!(semantics.image_type, ImageType::Unknown);
         assert_eq!(semantics.image_type_source, "unknown");
         assert_eq!(semantics.image_review_status, "unchecked");
@@ -95,7 +94,7 @@ fn migrates_actual_v1_schema_without_changing_legacy_data() {
             connection
                 .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            4
+            5
         );
         let original_embedding: Vec<u8> = connection
             .query_row(
@@ -294,12 +293,11 @@ fn v2_migration_preserves_captions_and_recovers_interrupted_embedding_jobs() {
     assert_eq!(item.caption.as_deref(), Some("旧含义"));
     assert_eq!(item.visible_text.as_deref(), Some("旧 OCR"));
     assert_eq!(item.embedding_status, "done");
-    assert!(database.requested_image_semantics().unwrap().is_empty());
     let raw = Connection::open(database.database_path()).unwrap();
     assert_eq!(
         raw.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        4
+        5
     );
     raw.execute(
         "UPDATE image_semantic_state SET embedding_status='running' WHERE content_id=?1",
@@ -352,6 +350,7 @@ fn v3_migration_rolls_back_and_preserves_semantics_on_reopen() {
     let raw = Connection::open(&path).unwrap();
     raw.execute_batch("DROP TABLE image_category_history;
         UPDATE metadata SET schema_version=3; PRAGMA user_version=3;
+        ALTER TABLE image_semantic_state ADD COLUMN requested INTEGER NOT NULL DEFAULT 0 CHECK(requested IN (0,1));
         CREATE TRIGGER reject_v4 BEFORE UPDATE ON metadata BEGIN SELECT RAISE(ABORT,'migration interrupted'); END;").unwrap();
     assert!(MemeDatabase::open(&root, FakeEmbeddingProvider::valid()).is_err());
     assert_eq!(
@@ -373,8 +372,16 @@ fn v3_migration_rolls_back_and_preserves_semantics_on_reopen() {
     for _ in 0..2 {
         let database = MemeDatabase::open(&root, FakeEmbeddingProvider::valid()).unwrap();
         assert_eq!(database.get_image_semantics(id).unwrap(), expected);
-        assert!(database.requested_image_semantics().unwrap().is_empty());
     }
+    let raw = Connection::open(&path).unwrap();
+    let columns = raw
+        .prepare("PRAGMA table_info(image_semantic_state)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!columns.iter().any(|column| column == "requested"));
 }
 
 #[test]
@@ -1223,9 +1230,6 @@ fn reopening_database_recovers_interrupted_semantic_jobs() {
         )
         .unwrap();
     let id = meme.contents[0].id();
-    assert!(database.requested_image_semantics().unwrap().is_empty());
-    database.request_image_semantics(&[id]).unwrap();
-    assert_eq!(database.requested_image_semantics().unwrap(), vec![id]);
     database
         .set_imported_image_types(&[(id, ImageType::Sticker)])
         .unwrap();
@@ -1251,7 +1255,6 @@ fn reopening_database_recovers_interrupted_semantic_jobs() {
     let semantics = database.get_image_semantics(id).unwrap();
     assert_eq!(semantics.status, "pending");
     assert_eq!(semantics.error, None);
-    assert_eq!(database.requested_image_semantics().unwrap(), vec![id]);
 }
 
 #[test]
@@ -1793,7 +1796,7 @@ fn enforces_embedding_compatibility_schema_version_and_media_integrity() {
     assert!(matches!(
         MemeDatabase::open(&storage, FakeEmbeddingProvider::valid()),
         Err(Error::UnsupportedSchemaVersion {
-            expected: 4,
+            expected: 5,
             actual: 99
         })
     ));
@@ -1884,7 +1887,6 @@ fn imported_image_type_requests_vlm_processing() {
     let semantics = database.get_image_semantics(id).unwrap();
     assert_eq!(semantics.image_type, ImageType::Sticker);
     assert_eq!(semantics.image_type_source, "imported");
-    assert_eq!(database.requested_image_semantics().unwrap(), vec![id]);
 }
 
 #[test]

@@ -27,7 +27,7 @@ dirs = "6.0.0"
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 gpui.workspace = true
 hex = "0.4.3"
-image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+image = { version = "0.25.9", default-features = false, features = ["avif-native", "gif", "jpeg", "png", "webp"] }
 memelith-clip.workspace = true
 memelith-core.workspace = true
 nom = "8.0.0"

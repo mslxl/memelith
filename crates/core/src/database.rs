@@ -19,7 +19,7 @@ use crate::{
     SimilarMemeImage, Tag, UpdateImageSemantics, UpdateMemeMetadata, UpdateMemePack,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const CONTENT_HASH_BYTES: usize = 32;
 const DATABASE_FILENAME: &str = "memelith.sqlite3";
 const MEDIA_DIRECTORY: &str = "media/images";
@@ -139,7 +139,7 @@ impl MemeDatabase {
         for (id, kind) in selections {
             let changed = transaction.execute("UPDATE meme_contents SET image_type=?1,image_type_source='imported',image_review_status='confirmed',semantic_status='pending',semantic_error=NULL,semantic_embedding_provider=NULL,semantic_embedding_model=NULL,semantic_embedding_dimension=NULL,semantic_embedding=NULL,semantic_text_hash=NULL WHERE id=?2 AND kind IN ('image','motion') AND image_type_source='unknown'", params![kind.as_database_str(),id.to_string()])?;
             if changed == 1 {
-                transaction.execute("INSERT INTO image_semantic_state(content_id,requested,embedding_status) SELECT id,1,'pending' FROM meme_contents WHERE id=?1 AND kind IN ('image','motion') ON CONFLICT(content_id) DO UPDATE SET requested=1", [id.to_string()])?;
+                transaction.execute("INSERT INTO image_semantic_state(content_id,embedding_status) SELECT id,'pending' FROM meme_contents WHERE id=?1 AND kind IN ('image','motion') ON CONFLICT(content_id) DO UPDATE SET embedding_status='pending',embedding_error=NULL", [id.to_string()])?;
             }
         }
         transaction.commit()?;
@@ -279,24 +279,9 @@ impl MemeDatabase {
                 "image content {content_id} was not found or is already running"
             )));
         }
-        transaction.execute("INSERT INTO image_semantic_state(content_id,requested) VALUES (?1,1) ON CONFLICT(content_id) DO UPDATE SET requested=1", [content_id.to_string()])?;
+        transaction.execute("INSERT INTO image_semantic_state(content_id) VALUES (?1) ON CONFLICT(content_id) DO NOTHING", [content_id.to_string()])?;
         transaction.commit()?;
         Ok(())
-    }
-
-    pub fn request_image_semantics(&mut self, ids: &[Uuid]) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        for id in ids {
-            transaction.execute("INSERT INTO image_semantic_state(content_id,requested) SELECT id,1 FROM meme_contents WHERE id=?1 AND kind IN ('image','motion') ON CONFLICT(content_id) DO UPDATE SET requested=1", [id.to_string()])?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn requested_image_semantics(&self) -> Result<Vec<Uuid>> {
-        self.connection.prepare("SELECT c.id FROM meme_contents c JOIN image_semantic_state s ON s.content_id=c.id WHERE s.requested=1 AND s.provenance<>'manual' AND c.semantic_status='pending' ORDER BY c.rowid")?
-            .query_map([], |row| uuid_from_column(row,0))?
-            .collect::<std::result::Result<Vec<_>,_>>().map_err(Error::from)
     }
 
     pub fn fail_image_semantics(&self, content_id: Uuid, error: &str) -> Result<()> {
@@ -553,7 +538,7 @@ impl MemeDatabase {
             "INSERT INTO image_semantic_state(content_id,category_fit,category_review_reason,suggested_category,embedding_status)
              VALUES (?1,?2,?3,?4,'pending') ON CONFLICT(content_id) DO UPDATE SET
              category_fit=excluded.category_fit, category_review_reason=excluded.category_review_reason,
-             suggested_category=excluded.suggested_category, embedding_status='pending', embedding_error=NULL, requested=0",
+             suggested_category=excluded.suggested_category, embedding_status='pending', embedding_error=NULL",
             params![content_id.to_string(), fit, reason, suggested],
         )?;
         if let Some((status, reason)) = transition {
@@ -609,7 +594,7 @@ impl MemeDatabase {
         }
         transaction.execute(
             "INSERT INTO image_semantic_state(content_id,provenance) VALUES (?1,'manual')
-             ON CONFLICT(content_id) DO UPDATE SET provenance='manual',embedding_status='pending',embedding_error=NULL,requested=0",
+            ON CONFLICT(content_id) DO UPDATE SET provenance='manual',embedding_status='pending',embedding_error=NULL",
             [content_id.to_string()],
         )?;
         transaction.commit()?;
@@ -2701,21 +2686,29 @@ fn initialize_database(
         0 => {
             create_schema(connection, model_id, embedding_dimension)?;
             migrate_schema_v2_to_v3(connection)?;
-            migrate_schema_v3_to_v4(connection)
+            migrate_schema_v3_to_v4(connection)?;
+            migrate_schema_v4_to_v5(connection)
         }
         1 => {
             migrate_schema_v1_to_v2(connection)?;
             migrate_schema_v2_to_v3(connection)?;
             migrate_schema_v3_to_v4(connection)?;
+            migrate_schema_v4_to_v5(connection)?;
             validate_database_metadata(connection, model_id, embedding_dimension)
         }
         2 => {
             migrate_schema_v2_to_v3(connection)?;
             migrate_schema_v3_to_v4(connection)?;
+            migrate_schema_v4_to_v5(connection)?;
             validate_database_metadata(connection, model_id, embedding_dimension)
         }
         3 => {
             migrate_schema_v3_to_v4(connection)?;
+            migrate_schema_v4_to_v5(connection)?;
+            validate_database_metadata(connection, model_id, embedding_dimension)
+        }
+        4 => {
+            migrate_schema_v4_to_v5(connection)?;
             validate_database_metadata(connection, model_id, embedding_dimension)
         }
         SCHEMA_VERSION => validate_database_metadata(connection, model_id, embedding_dimension),
@@ -2947,8 +2940,7 @@ fn migrate_schema_v2_to_v3(connection: &mut Connection) -> Result<()> {
             embedding_status TEXT NOT NULL DEFAULT 'pending' CHECK(embedding_status IN ('pending', 'running', 'done', 'failed')),
             embedding_error TEXT,
             index_version INTEGER NOT NULL DEFAULT 1,
-            built_at TEXT,
-            requested INTEGER NOT NULL DEFAULT 0 CHECK(requested IN (0,1))
+            built_at TEXT
         );
         INSERT INTO image_semantic_state(content_id, embedding_status)
         SELECT id, CASE WHEN semantic_embedding IS NOT NULL AND semantic_status = 'done' THEN 'done' ELSE 'pending' END
@@ -2977,6 +2969,24 @@ fn migrate_schema_v3_to_v4(connection: &mut Connection) -> Result<()> {
     )?;
     transaction.pragma_update(None, "user_version", 4)?;
     transaction.execute("UPDATE metadata SET schema_version = 4", [])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_schema_v4_to_v5(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let has_requested = transaction
+        .prepare("PRAGMA table_info(image_semantic_state)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|column| column == "requested");
+    if has_requested {
+        // Task intent is process-local now; remove its legacy column without touching results.
+        transaction.execute("ALTER TABLE image_semantic_state DROP COLUMN requested", [])?;
+    }
+    transaction.pragma_update(None, "user_version", 5)?;
+    transaction.execute("UPDATE metadata SET schema_version = 5", [])?;
     transaction.commit()?;
     Ok(())
 }

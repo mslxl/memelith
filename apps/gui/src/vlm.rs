@@ -83,6 +83,7 @@ pub struct VlmConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub reasoning_enabled: bool,
     pub reasoning_effort: Option<String>,
 }
 
@@ -92,6 +93,7 @@ impl From<crate::settings::VlmSettings> for VlmConfig {
             base_url: settings.base_url,
             api_key: settings.api_key,
             model: settings.model,
+            reasoning_enabled: settings.reasoning_enabled,
             reasoning_effort: settings.reasoning_effort,
         }
     }
@@ -222,8 +224,10 @@ fn request_body(config: &VlmConfig, prompt: &str, images: &[&str], mode: OutputM
         "temperature": 0,
         "max_tokens": 900
     });
-    if let Some(effort) = &config.reasoning_effort {
-        body["reasoning_effort"] = effort.clone().into();
+    if config.reasoning_enabled {
+        if let Some(effort) = config.reasoning_effort.as_deref() {
+            body["reasoning_effort"] = effort.into();
+        }
     }
     match mode {
         OutputMode::Tool => {
@@ -749,6 +753,7 @@ mod tests {
             base_url: "http://127.0.0.1:1/v1".to_owned(),
             api_key: "unused".to_owned(),
             model: "unused".to_owned(),
+            reasoning_enabled: false,
             reasoning_effort: None,
         };
         for extension in ["mp4", "webm", "tgs", "png"] {
@@ -802,6 +807,7 @@ mod tests {
             base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
             api_key: "mock-key".to_owned(),
             model: "mock-vision".to_owned(),
+            reasoning_enabled: true,
             reasoning_effort: Some("high".to_owned()),
         };
         let server = std::thread::spawn(move || {
@@ -1200,6 +1206,7 @@ mod tests {
             base_url: "".to_owned(),
             api_key: "key".to_owned(),
             model: "vision".to_owned(),
+            reasoning_enabled: true,
             reasoning_effort: Some("high".to_owned()),
         };
         assert!(matches!(
@@ -1256,6 +1263,7 @@ mod tests {
             base_url: "http://localhost".to_owned(),
             api_key: "key".to_owned(),
             model: "vision".to_owned(),
+            reasoning_enabled: false,
             reasoning_effort: None,
         };
         assert!(matches!(

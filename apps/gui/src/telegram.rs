@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -29,6 +30,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_MAX_IDLE_CONNECTIONS_PER_HOST: usize = 4;
 const MAX_TELEGRAM_WORKERS: usize = 4;
 const MAX_SIMILAR_PER_PAGE: usize = 9;
+const TELEGRAM_FILE_DOWNLOAD_LIMIT: u64 = 20 * 1024 * 1024;
 const STICKER_AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const TELEGRAM_STICKER_LINK_PREFIX: &str = "https://t.me/addstickers/";
 
@@ -48,6 +50,9 @@ enum TelegramError {
 
     #[error("image operation failed: {0}")]
     Image(#[from] image::ImageError),
+
+    #[error("media operation failed: {0}")]
+    Media(String),
 
     #[error("file operation failed: {0}")]
     Io(#[from] std::io::Error),
@@ -263,7 +268,6 @@ impl TelegramApi {
             .post(format!("{}/{method}", self.base_url))
             .json(&parameters)
             .send()?;
-        let response = response.error_for_status()?;
         let body = response.json::<ApiResponse<T>>()?;
         if !body.ok {
             return Err(TelegramError::Api(
@@ -304,13 +308,25 @@ impl TelegramApi {
             .strip_prefix(TELEGRAM_API)
             .ok_or_else(|| TelegramError::Api("invalid Telegram API URL".to_owned()))?;
         let url = format!("{TELEGRAM_API}/file{token_url}/{file_path}");
-        Ok(self
-            .client
-            .get(url)
-            .send()?
-            .error_for_status()?
-            .bytes()?
-            .to_vec())
+        let response = self.client.get(url).send()?.error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > TELEGRAM_FILE_DOWNLOAD_LIMIT)
+        {
+            return Err(TelegramError::Media(
+                "文件超过 Telegram Bot API 的 20 MB 下载限制".to_owned(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(TELEGRAM_FILE_DOWNLOAD_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > TELEGRAM_FILE_DOWNLOAD_LIMIT {
+            return Err(TelegramError::Media(
+                "文件超过 Telegram Bot API 的 20 MB 下载限制".to_owned(),
+            ));
+        }
+        Ok(bytes)
     }
 
     fn send_message(&self, chat_id: i64, text: &str) -> Result<Message, TelegramError> {
@@ -344,6 +360,40 @@ impl TelegramApi {
     ) -> Result<Vec<Message>, TelegramError> {
         if paths.is_empty() {
             return Ok(Vec::new());
+        }
+        let contains_gif = paths
+            .iter()
+            .map(|path| is_gif(path))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|is_gif| is_gif);
+        if contains_gif {
+            let mut messages: Vec<Message> = Vec::with_capacity(paths.len());
+            for (index, path) in paths.iter().enumerate() {
+                let animation = is_gif(path)?;
+                let mut form = multipart::Form::new().text("chat_id", chat_id.to_string());
+                if index == 0 {
+                    form = form.text("caption", caption.to_owned());
+                }
+                let result = if animation {
+                    self.multipart_call(
+                        "sendAnimation",
+                        form.part("animation", photo_part(path, index)?),
+                    )
+                } else {
+                    self.multipart_call("sendPhoto", form.part("photo", photo_part(path, index)?))
+                };
+                match result {
+                    Ok(message) => messages.push(message),
+                    Err(error) => {
+                        for message in &messages {
+                            let _ = self.delete_message(chat_id, message.message_id);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            return Ok(messages);
         }
         if paths.len() == 1 {
             let part = photo_part(&paths[0], 0)?;
@@ -402,7 +452,6 @@ impl TelegramApi {
             .post(format!("{}/{method}", self.base_url))
             .multipart(form)
             .send()?;
-        let response = response.error_for_status()?;
         let body = response.json::<ApiResponse<T>>()?;
         if !body.ok {
             return Err(TelegramError::Api(
@@ -949,6 +998,7 @@ fn handle_update(state: Arc<BotState>, update: Update) -> Result<(), TelegramErr
         let incoming = if let Some(photo) = largest_photo(&message.photo) {
             Some(IncomingTelegramMedia::Image {
                 file_id: photo.file_id,
+                file_size: photo.file_size,
             })
         } else if let Some(animation) = &message.animation {
             Some(IncomingTelegramMedia::Animation {
@@ -959,19 +1009,36 @@ fn handle_update(state: Arc<BotState>, update: Update) -> Result<(), TelegramErr
                     .map(|thumbnail| thumbnail.file_id.clone()),
                 width: animation.width,
                 height: animation.height,
+                file_name: animation.file_name.clone(),
+                mime_type: animation.mime_type.clone(),
+                file_size: animation.file_size,
+            })
+        } else if let Some(video) = &message.video {
+            Some(IncomingTelegramMedia::Video {
+                file_id: video.file_id.clone(),
+                thumbnail_file_id: video
+                    .thumbnail
+                    .as_ref()
+                    .map(|thumbnail| thumbnail.file_id.clone()),
+                width: video.width,
+                height: video.height,
+                file_name: video.file_name.clone(),
+                mime_type: video.mime_type.clone(),
+                file_size: video.file_size,
             })
         } else {
             message
-                .video
+                .document
                 .as_ref()
-                .map(|video| IncomingTelegramMedia::Video {
-                    file_id: video.file_id.clone(),
-                    thumbnail_file_id: video
+                .map(|document| IncomingTelegramMedia::Document {
+                    file_id: document.file_id.clone(),
+                    thumbnail_file_id: document
                         .thumbnail
                         .as_ref()
                         .map(|thumbnail| thumbnail.file_id.clone()),
-                    width: video.width,
-                    height: video.height,
+                    file_name: document.file_name.clone(),
+                    mime_type: document.mime_type.clone(),
+                    file_size: document.file_size,
                 })
         };
         let Some(incoming) = incoming else {
@@ -982,7 +1049,7 @@ fn handle_update(state: Arc<BotState>, update: Update) -> Result<(), TelegramErr
                 "send media failure message",
                 state
                     .api
-                    .send_message(chat_id, &format!("图片处理失败：{error}")),
+                    .send_message(chat_id, &format!("媒体处理失败：{error}")),
             );
             return Err(error);
         }
@@ -1084,19 +1151,124 @@ fn find_sticker_pack_reference(text: &str) -> Option<StickerPackReference> {
 enum IncomingTelegramMedia {
     Image {
         file_id: String,
+        file_size: Option<u64>,
     },
     Animation {
         file_id: String,
         thumbnail_file_id: Option<String>,
         width: u32,
         height: u32,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        file_size: Option<u64>,
     },
     Video {
         file_id: String,
         thumbnail_file_id: Option<String>,
         width: u32,
         height: u32,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        file_size: Option<u64>,
     },
+    Document {
+        file_id: String,
+        thumbnail_file_id: Option<String>,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        file_size: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum IncomingMediaKind {
+    Image,
+    Animation,
+    Video,
+    Document,
+}
+
+fn normalize_image(bytes: Vec<u8>) -> Result<(Vec<u8>, Option<&'static str>), TelegramError> {
+    let Some(format) = image::guess_format(&bytes).ok() else {
+        return Ok((bytes, None));
+    };
+    let extension = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::WebP => "webp",
+        image::ImageFormat::Gif => "gif",
+        image::ImageFormat::Avif => {
+            // AVIF is decoded at the Telegram boundary because the database's image contract uses established formats.
+            let decoded = image::load_from_memory_with_format(&bytes, format)?;
+            let mut encoded = Vec::new();
+            decoded.write_to(&mut Cursor::new(&mut encoded), image::ImageFormat::Png)?;
+            return Ok((encoded, Some("png")));
+        }
+        _ => return Ok((bytes, None)),
+    };
+    Ok((bytes, Some(extension)))
+}
+
+fn motion_format_hint(
+    file_path: &str,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+) -> Option<MotionFormat> {
+    if let Some(mime_type) = mime_type {
+        if mime_type.eq_ignore_ascii_case("video/webm") {
+            return Some(MotionFormat::WebM);
+        }
+        if mime_type.eq_ignore_ascii_case("video/mp4") {
+            return Some(MotionFormat::Mp4);
+        }
+    }
+    file_name
+        .and_then(motion_format_from_path)
+        .or_else(|| motion_format_from_path(file_path))
+}
+
+fn motion_format_from_path(path: &str) -> Option<MotionFormat> {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "webm" => Some(MotionFormat::WebM),
+        "mp4" | "m4v" => Some(MotionFormat::Mp4),
+        _ => None,
+    }
+}
+
+fn motion_extension(format: MotionFormat) -> &'static str {
+    match format {
+        MotionFormat::Mp4 => "mp4",
+        MotionFormat::WebM => "webm",
+        MotionFormat::Tgs => "tgs",
+    }
+}
+
+fn motion_dimensions(path: &Path) -> Result<(u32, u32), TelegramError> {
+    use ffmpeg_next as ffmpeg;
+
+    ffmpeg::init().map_err(|error| TelegramError::Media(error.to_string()))?;
+    let input = ffmpeg::format::input(path)
+        .map_err(|error| TelegramError::Media(format!("无法读取 {}：{error}", path.display())))?;
+    let stream = input
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| TelegramError::Media("文件不包含视频流".to_owned()))?;
+    let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|error| TelegramError::Media(format!("无法读取视频参数：{error}")))?;
+    let decoder = context
+        .decoder()
+        .video()
+        .map_err(|error| TelegramError::Media(format!("无法打开视频流：{error}")))?;
+    let dimensions = (decoder.width(), decoder.height());
+    if dimensions.0 == 0 || dimensions.1 == 0 {
+        return Err(TelegramError::Media("视频尺寸无效".to_owned()));
+    }
+    Ok(dimensions)
 }
 
 fn handle_media(
@@ -1105,64 +1277,130 @@ fn handle_media(
     incoming: IncomingTelegramMedia,
 ) -> Result<(), TelegramError> {
     let sender = message.from.as_ref().ok_or(TelegramError::MissingSender)?;
-    let (file_id, thumbnail_file_id, dimensions, animation) = match incoming {
-        IncomingTelegramMedia::Image { file_id } => (file_id, None, None, false),
-        IncomingTelegramMedia::Animation {
-            file_id,
-            thumbnail_file_id,
-            width,
-            height,
-        } => (file_id, thumbnail_file_id, Some((width, height)), true),
-        IncomingTelegramMedia::Video {
-            file_id,
-            thumbnail_file_id,
-            width,
-            height,
-        } => (file_id, thumbnail_file_id, Some((width, height)), false),
-    };
+    let (file_id, thumbnail_file_id, dimensions, file_name, mime_type, file_size, kind) =
+        match incoming {
+            IncomingTelegramMedia::Image { file_id, file_size } => (
+                file_id,
+                None,
+                None,
+                None,
+                None,
+                file_size,
+                IncomingMediaKind::Image,
+            ),
+            IncomingTelegramMedia::Animation {
+                file_id,
+                thumbnail_file_id,
+                width,
+                height,
+                file_name,
+                mime_type,
+                file_size,
+            } => (
+                file_id,
+                thumbnail_file_id,
+                Some((width, height)),
+                file_name,
+                mime_type,
+                file_size,
+                IncomingMediaKind::Animation,
+            ),
+            IncomingTelegramMedia::Video {
+                file_id,
+                thumbnail_file_id,
+                width,
+                height,
+                file_name,
+                mime_type,
+                file_size,
+            } => (
+                file_id,
+                thumbnail_file_id,
+                Some((width, height)),
+                file_name,
+                mime_type,
+                file_size,
+                IncomingMediaKind::Video,
+            ),
+            IncomingTelegramMedia::Document {
+                file_id,
+                thumbnail_file_id,
+                file_name,
+                mime_type,
+                file_size,
+            } => (
+                file_id,
+                thumbnail_file_id,
+                None,
+                file_name,
+                mime_type,
+                file_size,
+                IncomingMediaKind::Document,
+            ),
+        };
+    if file_size.is_some_and(|size| size > TELEGRAM_FILE_DOWNLOAD_LIMIT) {
+        return Err(TelegramError::Media(
+            "文件超过 Telegram Bot API 的 20 MB 下载限制".to_owned(),
+        ));
+    }
     let file = state.api.get_file(&file_id)?;
     let file_path = file.file_path.ok_or(TelegramError::MissingFilePath)?;
     let bytes = state.api.download_file(&file_path)?;
+    let (bytes, image_extension) = normalize_image(bytes)?;
+    let motion_format = if image_extension.is_none() {
+        motion_format_hint(&file_path, file_name.as_deref(), mime_type.as_deref()).or(match kind {
+            IncomingMediaKind::Animation | IncomingMediaKind::Video => Some(MotionFormat::Mp4),
+            IncomingMediaKind::Image | IncomingMediaKind::Document => None,
+        })
+    } else {
+        None
+    };
+    if image_extension.is_none() && motion_format.is_none() {
+        let description = file_name
+            .as_deref()
+            .or(mime_type.as_deref())
+            .unwrap_or(&file_path);
+        return Err(TelegramError::Api(format!(
+            "不支持 Telegram 媒体格式：{description}"
+        )));
+    }
     let incoming_directory = state.storage_root.join(".telegram/incoming");
     fs::create_dir_all(&incoming_directory)?;
-    let extension = Path::new(&file_path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or(if dimensions.is_some() { "mp4" } else { "image" });
+    let extension = image_extension.unwrap_or_else(|| {
+        motion_extension(motion_format.expect("media format was validated above"))
+    });
     let source_path = incoming_directory.join(format!("{}.{extension}", Uuid::new_v4()));
     let mut source_file = TempFileGuard::new(source_path);
     fs::write(source_file.path(), bytes)?;
 
-    let media = match dimensions {
-        None => IncomingMedia::Image,
-        Some(_) if extension.eq_ignore_ascii_case("gif") => IncomingMedia::Image,
-        Some((width, height)) => IncomingMedia::Motion {
+    let media = if image_extension.is_some() {
+        IncomingMedia::Image
+    } else {
+        let (width, height) = dimensions
+            .map(Ok)
+            .unwrap_or_else(|| motion_dimensions(source_file.path()))?;
+        IncomingMedia::Motion {
             width,
             height,
-            format: if extension.eq_ignore_ascii_case("webm") {
-                MotionFormat::WebM
-            } else if animation || extension.eq_ignore_ascii_case("mp4") {
-                MotionFormat::Mp4
-            } else {
-                return Err(TelegramError::Api(format!(
-                    "不支持 Telegram 媒体格式：{extension}"
-                )));
-            },
-        },
+            format: motion_format.expect("motion format was validated above"),
+        }
     };
-    let mut preview_file = thumbnail_file_id
-        .map(|thumbnail_file_id| -> Result<_, TelegramError> {
-            let thumbnail = state.api.get_file(&thumbnail_file_id)?;
-            let thumbnail_path = thumbnail.file_path.ok_or(TelegramError::MissingFilePath)?;
-            let preview_path = incoming_directory.join(format!("{}.preview", Uuid::new_v4()));
-            let preview_file = TempFileGuard::new(preview_path);
-            fs::write(
-                preview_file.path(),
-                state.api.download_file(&thumbnail_path)?,
-            )?;
-            Ok(preview_file)
-        })
-        .transpose()?;
+    let mut preview_file = match &media {
+        IncomingMedia::Image => None,
+        IncomingMedia::Motion { .. } => thumbnail_file_id
+            .map(|thumbnail_file_id| -> Result<_, TelegramError> {
+                let thumbnail = state.api.get_file(&thumbnail_file_id)?;
+                let thumbnail_path = thumbnail.file_path.ok_or(TelegramError::MissingFilePath)?;
+                let preview_path = incoming_directory.join(format!("{}.preview", Uuid::new_v4()));
+                let preview_file = TempFileGuard::new(preview_path);
+                fs::write(
+                    preview_file.path(),
+                    state.api.download_file(&thumbnail_path)?,
+                )?;
+                Ok(preview_file)
+            })
+            .transpose()?,
+    };
     let preview_path = match &media {
         IncomingMedia::Image => Some(source_file.path()),
         IncomingMedia::Motion { .. } => preview_file.as_ref().map(TempFileGuard::path),
@@ -1627,6 +1865,10 @@ fn photo_part(path: &Path, index: usize) -> Result<multipart::Part, TelegramErro
         .mime_str(format.to_mime_type())?)
 }
 
+fn is_gif(path: &Path) -> Result<bool, TelegramError> {
+    Ok(image::guess_format(&fs::read(path)?)? == image::ImageFormat::Gif)
+}
+
 fn delete_confirmation_messages(
     state: &BotState,
     operation: &PendingOperation,
@@ -1778,6 +2020,8 @@ struct Message {
     #[serde(default)]
     video: Option<Video>,
     #[serde(default)]
+    document: Option<Document>,
+    #[serde(default)]
     sticker: Option<Sticker>,
 }
 
@@ -1806,6 +2050,12 @@ struct Animation {
     height: u32,
     #[serde(default)]
     thumbnail: Option<PhotoSize>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1815,6 +2065,25 @@ struct Video {
     height: u32,
     #[serde(default)]
     thumbnail: Option<PhotoSize>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Document {
+    file_id: String,
+    #[serde(default)]
+    thumbnail: Option<PhotoSize>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

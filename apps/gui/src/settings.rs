@@ -16,6 +16,7 @@ const VLM_BASE_URL_FILE: &str = "vlm-base-url";
 const VLM_API_KEY_FILE: &str = "vlm-api-key";
 const VLM_MODEL_FILE: &str = "vlm-model";
 const VLM_REASONING_EFFORT_FILE: &str = "vlm-reasoning-effort";
+const VLM_REASONING_ENABLED_FILE: &str = "vlm-reasoning-enabled";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TelegramSettings {
@@ -28,6 +29,8 @@ pub struct VlmSettings {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    // Opt-in because Bifrost's OpenAI-compatible route can rewrite Qwen xhigh.
+    pub reasoning_enabled: bool,
     pub reasoning_effort: Option<String>,
 }
 
@@ -43,11 +46,13 @@ fn load_vlm_settings_from(directory: &Path) -> Result<VlmSettings, SettingsError
             Err(error) => Err(error.into()),
         }
     };
+    let reasoning_enabled = read(VLM_REASONING_ENABLED_FILE)? == "true";
     let reasoning = read(VLM_REASONING_EFFORT_FILE)?;
     Ok(VlmSettings {
         base_url: read(VLM_BASE_URL_FILE)?,
         api_key: read(VLM_API_KEY_FILE)?,
         model: read(VLM_MODEL_FILE)?,
+        reasoning_enabled,
         reasoning_effort: (!reasoning.is_empty()).then_some(reasoning),
     })
 }
@@ -77,6 +82,10 @@ fn save_vlm_settings_to(directory: &Path, settings: &VlmSettings) -> Result<(), 
     fs::write(
         directory.join(VLM_MODEL_FILE),
         format!("{}\n", settings.model.trim()),
+    )?;
+    fs::write(
+        directory.join(VLM_REASONING_ENABLED_FILE),
+        format!("{}\n", settings.reasoning_enabled),
     )?;
     fs::write(
         directory.join(VLM_REASONING_EFFORT_FILE),
@@ -219,6 +228,7 @@ mod tests {
 
     #[test]
     fn vlm_settings_defaults_are_explicit() {
+        assert!(!VlmSettings::default().reasoning_enabled);
         assert_eq!(VlmSettings::default().reasoning_effort, None);
     }
 
@@ -241,6 +251,7 @@ mod tests {
             base_url: "https://example.test/v1".to_owned(),
             api_key: "local-test-key".to_owned(),
             model: "vision-model".to_owned(),
+            reasoning_enabled: true,
             reasoning_effort: Some("high".to_owned()),
         };
         super::save_vlm_settings_to(&directory, &settings).unwrap();

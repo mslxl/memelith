@@ -343,6 +343,31 @@ fn checkbox(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
         })
 }
 
+fn toggle_switch(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(38.))
+        .h(px(22.))
+        .p(px(2.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .rounded_full()
+        .cursor_pointer()
+        .when(checked, |style| {
+            style
+                .justify_end()
+                .bg(rgb(ACCENT))
+                .child(div().size(px(18.)).rounded_full().bg(rgb(0xffffff)))
+        })
+        .when(!checked, |style| {
+            style
+                .justify_start()
+                .bg(rgba(0x00000026))
+                .child(div().size(px(18.)).rounded_full().bg(rgb(0xffffff)))
+        })
+}
+
 fn context_menu() -> Div {
     div()
         .min_w(px(180.))
@@ -1099,7 +1124,6 @@ impl MemelithView {
                             view.semantic_items.clear();
                             view.semantic_editing = None;
                             view.start_semantic_rebuild(cx);
-                            view.resume_requested_semantics(cx);
                             view.waifu_sensor = None;
                             view.storage_root = Some(canonical_root.clone());
                             view.inbox_id = Some(opened.inbox_id);
@@ -1292,7 +1316,7 @@ impl MemelithView {
                     )));
                 }
                 self.start_refresh_library(cx);
-                self.resume_requested_semantics(cx);
+                self.start_imported_vlm_jobs(pack_id, cx);
             }
             telegram::TelegramBotStatus::StickerPackSyncFailed {
                 pack_id,
@@ -1458,16 +1482,26 @@ impl MemelithView {
             base_url: self.vlm_base_url_input.read(cx).text().trim().to_owned(),
             api_key: self.vlm_api_key_input.read(cx).text().trim().to_owned(),
             model: self.vlm_model_input.read(cx).text().trim().to_owned(),
+            reasoning_enabled: self.vlm_settings.reasoning_enabled,
             reasoning_effort: (!reasoning.is_empty()).then_some(reasoning),
         };
         match settings::save_vlm_settings(&settings) {
             Ok(()) => {
                 self.vlm_settings = settings;
                 self.notice = Some(Notice::Success("VLM 设置已保存".to_owned()));
-                self.resume_requested_semantics(cx);
             }
             Err(error) => self.notice = Some(Notice::Error(format!("无法保存 VLM 设置：{error}"))),
         }
+        cx.notify();
+    }
+
+    fn toggle_vlm_reasoning(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.vlm_settings.reasoning_enabled = !self.vlm_settings.reasoning_enabled;
         cx.notify();
     }
 
@@ -2466,11 +2500,22 @@ impl MemelithView {
         cx.notify();
     }
 
-    fn resume_requested_semantics(&mut self, cx: &mut Context<Self>) {
+    fn start_imported_vlm_jobs(&mut self, pack_id: Uuid, cx: &mut Context<Self>) {
         let ids = self
             .database
             .as_ref()
-            .and_then(|database| database.lock().ok()?.requested_image_semantics().ok())
+            .and_then(|database| database.lock().ok())
+            .and_then(|database| database.list_image_semantics(Some(pack_id)).ok())
+            .map(|items| {
+                items
+                    .into_iter()
+                    .filter(|item| {
+                        item.image_type_source == "imported"
+                            && matches!(item.status.as_str(), "pending" | "failed")
+                    })
+                    .map(|item| item.content_id)
+                    .collect()
+            })
             .unwrap_or_default();
         self.start_vlm_jobs(ids, cx);
     }
@@ -3047,23 +3092,17 @@ impl MemelithView {
     }
 
     fn start_vlm_jobs(&mut self, content_ids: Vec<Uuid>, cx: &mut Context<Self>) {
-        if let Some(database) = self.database.clone() {
-            if let Ok(mut database) = database.lock() {
-                if let Err(error) = database.request_image_semantics(&content_ids) {
-                    self.notice = Some(Notice::Error(error.to_string()));
-                    return;
-                }
-            }
-        }
         if self.semantic_jobs_running {
             self.semantic_job_queue.extend(content_ids);
             return;
         }
-        let config = vlm::VlmConfig::from(self.vlm_settings.clone());
         if content_ids.is_empty() {
             return;
         }
-        if config.validate().is_err() {
+        if vlm::VlmConfig::from(self.vlm_settings.clone())
+            .validate()
+            .is_err()
+        {
             self.notice = Some(Notice::Info("请先在设置中配置 VLM".to_owned()));
             return;
         }
@@ -3077,7 +3116,12 @@ impl MemelithView {
             let mut errors = Vec::new();
             for (index, content_id) in content_ids.into_iter().enumerate() {
                 let database = database.clone();
-                let config = config.clone();
+                let config = match this.update(cx, |view, _| {
+                    vlm::VlmConfig::from(view.vlm_settings.clone())
+                }) {
+                    Ok(config) => config,
+                    Err(_) => return,
+                };
                 let result = cx
                     .background_executor()
                     .spawn(async move {
@@ -5710,6 +5754,25 @@ impl MemelithView {
                         group_row()
                             .child(div().w(px(110.)).child("思考强度"))
                             .child(div().flex_1().child(self.vlm_reasoning_input.clone())),
+                    )
+                    .child(hairline())
+                    .child(
+                        group_row()
+                            .child(
+                                div().flex_1().child("发送 reasoning_effort").child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgba(LABEL_3))
+                                        .child("关闭时不向网关发送思考强度参数。"),
+                                ),
+                            )
+                            .child(
+                                toggle_switch(
+                                    "vlm-reasoning-enabled",
+                                    self.vlm_settings.reasoning_enabled,
+                                )
+                                .on_click(cx.listener(Self::toggle_vlm_reasoning)),
+                            ),
                     )
                     .child(
                         group_row().justify_end().child(
