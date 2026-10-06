@@ -467,6 +467,7 @@ pub fn analyze_image_data_urls(
     let key = (config.base_url.clone(), config.model.clone());
     let mut tool_mode = !cache.lock().unwrap().contains(&key);
     let client = Client::builder()
+        .user_agent(concat!("Memelith/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(120))
         .build()?;
     let response = if tool_mode {
