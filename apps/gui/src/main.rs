@@ -17,8 +17,8 @@ use std::{
 use gpui::{
     AnyElement, App, Application, Bounds, BoxShadow, Context, Corner, DevicePixels, Div, Element,
     ElementId, Entity, Focusable, FontWeight, GlobalElementId, InspectorElementId, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point,
-    PromptButton, PromptLevel, SharedString, Stateful, Style, StyleRefinement,
+    LayoutId, ListSizingBehavior, MouseButton, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, Point,
+    PromptButton, PromptLevel, ScrollStrategy, SharedString, Stateful, Style, StyleRefinement,
     UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowOptions, actions, anchored, deferred, div, hsla, img, linear_color_stop, linear_gradient,
     point, prelude::*, px, relative, rgb, rgba, size, uniform_list,
@@ -668,6 +668,10 @@ struct MemelithView {
     vlm_model_input: Entity<TextInput>,
     vlm_reasoning_input: Entity<TextInput>,
     semantic_items: Vec<memelith_core::ImageSemantics>,
+    semantic_offset: usize,
+    semantic_has_more: bool,
+    semantic_loading_more: bool,
+    semantic_scroll_handle: UniformListScrollHandle,
     semantic_editing: Option<Uuid>,
     semantic_edit_type: ImageType,
     semantic_caption_input: Entity<TextInput>,
@@ -678,9 +682,13 @@ struct MemelithView {
     semantic_revising: bool,
     semantic_pack_filter: Option<Uuid>,
     semantic_review_only: bool,
+    semantic_type_filter: Option<ImageType>,
+    semantic_status_filter: Option<String>, // "pending", "done", "failed"
     semantic_jobs_running: bool,
     semantic_job_progress: (usize, usize),
     semantic_job_queue: Vec<Uuid>,
+    semantic_selected_items: HashSet<Uuid>,
+    semantic_rebuild_pending: bool,
     notice: Option<Notice>,
     opening_storage: bool,
     analyzing_images: bool,
@@ -790,6 +798,10 @@ impl MemelithView {
             vlm_model_input,
             vlm_reasoning_input,
             semantic_items: Vec::new(),
+            semantic_offset: 0,
+            semantic_has_more: true,
+            semantic_loading_more: false,
+            semantic_scroll_handle: UniformListScrollHandle::new(),
             semantic_editing: None,
             semantic_edit_type: ImageType::Unknown,
             semantic_caption_input: cx.new(|cx| TextInput::new("语义描述", cx)),
@@ -800,9 +812,13 @@ impl MemelithView {
             semantic_revising: false,
             semantic_pack_filter: None,
             semantic_review_only: true,
+            semantic_type_filter: None,
+            semantic_status_filter: None,
             semantic_jobs_running: false,
             semantic_job_progress: (0, 0),
             semantic_job_queue: Vec::new(),
+            semantic_selected_items: HashSet::new(),
+            semantic_rebuild_pending: false,
             notice: None,
             opening_storage: false,
             analyzing_images: false,
@@ -2520,22 +2536,76 @@ impl MemelithView {
         self.start_vlm_jobs(ids, cx);
     }
 
-    fn refresh_semantic_items(&mut self) {
+    fn refresh_semantic_items(&mut self, cx: &mut Context<Self>) {
+        // Clear existing data and reload from the first page
+        self.semantic_items.clear();
+        self.semantic_offset = 0;
+        self.semantic_has_more = true;
+        self.semantic_loading_more = false;
+
+        // Scroll to top
+        self.semantic_scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+
+        // Load first page
+        self.load_more_semantic_items(cx);
+    }
+
+    fn load_more_semantic_items(&mut self, cx: &mut Context<Self>) {
+        if self.semantic_loading_more || !self.semantic_has_more {
+            return;
+        }
+
         let Some(database) = self.database.clone() else {
-            self.semantic_items.clear();
             return;
         };
-        match database
-            .lock()
-            .map_err(|_| "数据库锁已损坏".to_owned())
-            .and_then(|database| {
-                database
-                    .list_image_semantics(self.semantic_pack_filter)
-                    .map_err(|error| error.to_string())
-            }) {
-            Ok(items) => self.semantic_items = items,
-            Err(error) => self.notice = Some(Notice::Error(error)),
-        }
+
+        let pack_filter = self.semantic_pack_filter;
+        let review_only = self.semantic_review_only;
+        let type_filter = self.semantic_type_filter;
+        let status_filter = self.semantic_status_filter.clone();
+        let offset = self.semantic_offset;
+        let limit = LIBRARY_PAGE_SIZE;
+
+        self.semantic_loading_more = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    database
+                        .lock()
+                        .map_err(|_| "数据库锁已损坏".to_owned())
+                        .and_then(|db| {
+                            db.list_image_semantics_page(
+                                pack_filter,
+                                review_only,
+                                type_filter,
+                                status_filter.as_deref(),
+                                offset,
+                                limit,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                view.semantic_loading_more = false;
+                match result {
+                    Ok(mut new_items) => {
+                        view.semantic_has_more = new_items.len() == limit;
+                        view.semantic_offset += new_items.len();
+                        view.semantic_items.append(&mut new_items);
+                    }
+                    Err(error) => {
+                        view.notice = Some(Notice::Error(error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn edit_semantic_item(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -2691,14 +2761,79 @@ impl MemelithView {
         match result {
             Ok(()) => {
                 self.semantic_editing = None;
-                self.refresh_semantic_items();
-                self.start_semantic_rebuild(cx);
+                self.refresh_semantic_items(cx);
+                self.schedule_semantic_rebuild(cx);
                 self.start_refresh_library(cx);
                 self.notice = Some(Notice::Success("语义内容已保存".to_owned()));
             }
             Err(error) => self.notice = Some(Notice::Error(error)),
         }
         cx.notify();
+    }
+
+    fn batch_resolve_semantic_items(&mut self, image_type: ImageType, cx: &mut Context<Self>) {
+        if self.semantic_selected_items.is_empty() {
+            self.notice = Some(Notice::Error("未选择任何项目".to_owned()));
+            cx.notify();
+            return;
+        }
+
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+
+        let selected_ids: Vec<Uuid> = self.semantic_selected_items.iter().copied().collect();
+        let count = selected_ids.len();
+
+        let result = database
+            .lock()
+            .map_err(|_| "数据库锁已损坏".to_owned())
+            .and_then(|mut database| {
+                for id in selected_ids {
+                    database
+                        .resolve_image_review(id, image_type)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            });
+
+        match result {
+            Ok(()) => {
+                self.semantic_selected_items.clear();
+                self.refresh_semantic_items(cx);
+                self.schedule_semantic_rebuild(cx);
+                self.notice = Some(Notice::Success(format!("已批量标记 {} 个项目", count)));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::Error(error));
+            }
+        }
+        cx.notify();
+    }
+
+    fn schedule_semantic_rebuild(&mut self, cx: &mut Context<Self>) {
+        // Mark that a rebuild is pending
+        self.semantic_rebuild_pending = true;
+
+        // Schedule the actual rebuild after a 2-second delay
+        cx.spawn(async move |this, cx| {
+            // Wait 2 seconds
+            cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+
+            // Check if rebuild is still pending
+            let should_rebuild = this.update(cx, |view, _| {
+                let pending = view.semantic_rebuild_pending;
+                view.semantic_rebuild_pending = false;
+                pending
+            }).unwrap_or(false);
+
+            if should_rebuild {
+                let _ = this.update(cx, |view, cx| {
+                    view.start_semantic_rebuild(cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn start_semantic_rebuild(&mut self, cx: &mut Context<Self>) {
@@ -2749,7 +2884,7 @@ impl MemelithView {
                                 }) {
                                     return false;
                                 }
-                                view.refresh_semantic_items();
+                                view.refresh_semantic_items(cx);
                                 cx.notify();
                                 true
                             })
@@ -2775,7 +2910,7 @@ impl MemelithView {
                         errors.join("; ")
                     )));
                 }
-                view.refresh_semantic_items();
+                view.refresh_semantic_items(cx);
                 cx.notify();
             });
         })
@@ -2783,12 +2918,10 @@ impl MemelithView {
     }
 
     fn render_semantics_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let items = self.semantic_items.iter().filter(|item| {
-            !self.semantic_review_only
-                || item.image_review_status == "needs_review"
-                || (item.image_type == ImageType::Unknown
-                    && item.image_review_status != "confirmed")
-        });
+        // No need for in-memory filtering - database already filtered the data
+        let item_count = self.semantic_items.len();
+        let row_count = item_count;
+
         div()
             .size_full()
             .flex()
@@ -2810,14 +2943,52 @@ impl MemelithView {
                             })
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.semantic_review_only = !view.semantic_review_only;
-                                cx.notify();
+                                view.refresh_semantic_items(cx);
+                            })),
+                    )
+                    .child(
+                        glass_pill("semantic-type-filter")
+                            .child(match self.semantic_type_filter {
+                                None => "全部类型",
+                                Some(ImageType::Sticker) => "仅Sticker",
+                                Some(ImageType::Illustration) => "仅插画",
+                                Some(ImageType::Unknown) => "仅未知",
+                            })
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.semantic_type_filter = match view.semantic_type_filter {
+                                    None => Some(ImageType::Sticker),
+                                    Some(ImageType::Sticker) => Some(ImageType::Illustration),
+                                    Some(ImageType::Illustration) => Some(ImageType::Unknown),
+                                    Some(ImageType::Unknown) => None,
+                                };
+                                view.refresh_semantic_items(cx);
+                            })),
+                    )
+                    .child(
+                        glass_pill("semantic-status-filter")
+                            .child(match self.semantic_status_filter.as_deref() {
+                                None => "全部状态",
+                                Some("pending") => "待处理",
+                                Some("done") => "已完成",
+                                Some("failed") => "失败",
+                                _ => "全部状态",
+                            })
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.semantic_status_filter = match view.semantic_status_filter.as_deref() {
+                                    None => Some("pending".to_owned()),
+                                    Some("pending") => Some("done".to_owned()),
+                                    Some("done") => Some("failed".to_owned()),
+                                    Some("failed") => None,
+                                    _ => None,
+                                };
+                                view.refresh_semantic_items(cx);
                             })),
                     )
                     .child(
                         glass_pill("semantic-refresh")
                             .child("刷新")
                             .on_click(cx.listener(|view, _, _, cx| {
-                                view.refresh_semantic_items();
+                                view.refresh_semantic_items(cx);
                                 cx.notify();
                             })),
                     )
@@ -2849,7 +3020,36 @@ impl MemelithView {
                             .on_click(
                                 cx.listener(|view, _, _, cx| view.start_semantic_rebuild(cx)),
                             ),
-                    ),
+                    )
+                    .when(!self.semantic_selected_items.is_empty(), |div| {
+                        div
+                            .child(
+                                glass_pill("semantic-batch-clear")
+                                    .child(format!("取消选择 ({})", self.semantic_selected_items.len()))
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.semantic_selected_items.clear();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                glass_pill("semantic-batch-sticker")
+                                    .child("批量→Sticker")
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.batch_resolve_semantic_items(ImageType::Sticker, cx);
+                                    })),
+                            )
+                            .child(
+                                glass_pill("semantic-batch-illustration")
+                                    .child("批量→插画")
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.batch_resolve_semantic_items(ImageType::Illustration, cx);
+                                    })),
+                            )
+                    }),
             )
             .child(
                 div()
@@ -2861,7 +3061,7 @@ impl MemelithView {
                             .child("全部资源包")
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.semantic_pack_filter = None;
-                                view.refresh_semantic_items();
+                                view.refresh_semantic_items(cx);
                                 cx.notify();
                             })),
                     )
@@ -2874,221 +3074,311 @@ impl MemelithView {
                             })
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.semantic_pack_filter = Some(id);
-                                view.refresh_semantic_items();
+                                view.refresh_semantic_items(cx);
                                 cx.notify();
                             }))
                     })),
             )
             .child(
-                div()
-                    .id("semantic-review-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(items.map(|item| {
-                        let id = item.content_id;
-                        let mut row = div()
-                            .id(SharedString::from(format!("semantic-item-{id}")))
-                            .flex()
-                            .gap_4()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(rgba(LABEL_3));
-                        if let Some(root) = &self.storage_root {
-                            row = row.child(
-                                img(root.join(&item.relative_path))
-                                    .w(px(128.))
-                                    .h(px(128.))
-                                    .object_fit(ObjectFit::Contain),
-                            );
+                uniform_list(
+                    "semantic-review-list",
+                    row_count,
+                    cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                        // Load more when approaching bottom
+                        if range.end + 2 >= row_count && !view.semantic_loading_more {
+                            view.load_more_semantic_items(cx);
                         }
-                        row.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(div().text_sm().child(format!(
-                                    "{} · {} · 索引 {}",
-                                    item.relative_path.display(),
-                                    item.status,
-                                    item.embedding_status
-                                )))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .child(item.caption.clone().unwrap_or_default()),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .child(item.visible_text.clone().unwrap_or_default()),
-                                )
-                                .children(item.reclassification_history.iter().rev().map(
-                                    |record| {
-                                        div().text_xs().text_color(rgba(LABEL_2)).child(format!(
-                                            "{} · {} → {} · {}",
-                                            record.at,
-                                            record.from_category,
-                                            record.to_category,
-                                            record.reason
-                                        ))
-                                    },
-                                ))
-                                .child(div().text_xs().text_color(rgba(LABEL_2)).child(format!(
-                                        "{} {} {}",
-                                        item.category_review_reason.as_deref().unwrap_or(""),
-                                        item.suggested_category.as_deref().unwrap_or(""),
-                                        item.embedding_error
-                                            .as_deref()
-                                            .or(item.error.as_deref())
-                                            .unwrap_or("")
-                                    )))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .children(
-                                            [
-                                                (ImageType::Unknown, "未知"),
-                                                (ImageType::Sticker, "Sticker"),
-                                                (ImageType::Illustration, "插画"),
-                                            ]
-                                            .into_iter()
-                                            .enumerate()
-                                            .map(
-                                                |(index, (kind, label))| {
-                                                    glass_pill(SharedString::from(format!(
-                                                        "semantic-type-{id}-{index}"
-                                                    )))
-                                                    .child(label)
-                                                    .when(item.image_type == kind, |button| {
-                                                        button
-                                                            .bg(rgb(ACCENT))
-                                                            .text_color(rgb(0xffffff))
-                                                    })
-                                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                                        if let Some(database) =
-                                                            view.database.clone()
-                                                        {
-                                                            let result = database
-                                                                .lock()
-                                                                .map_err(|_| {
-                                                                    "数据库锁已损坏".to_owned()
-                                                                })
-                                                                .and_then(|mut database| {
-                                                                    database
-                                                                        .resolve_image_review(
-                                                                            id, kind,
-                                                                        )
-                                                                        .map_err(|e| e.to_string())
-                                                                });
-                                                            if let Err(error) = result {
-                                                                view.notice =
-                                                                    Some(Notice::Error(error));
-                                                            } else if view.semantic_editing
-                                                                == Some(id)
-                                                            {
-                                                                view.semantic_edit_type = kind;
-                                                            }
-                                                            view.refresh_semantic_items();
-                                                            view.start_semantic_rebuild(cx);
-                                                            cx.notify();
-                                                        }
-                                                    }))
-                                                },
-                                            ),
-                                        )
-                                        .child(
-                                            glass_pill(SharedString::from(format!(
-                                                "semantic-edit-{id}"
-                                            )))
-                                            .child("编辑")
-                                            .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.edit_semantic_item(id, cx)
-                                            })),
-                                        )
-                                        .child(
-                                            glass_pill(SharedString::from(format!(
-                                                "semantic-retry-{id}"
-                                            )))
-                                            .child("重试")
-                                            .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.start_vlm_jobs(vec![id], cx);
-                                                cx.notify();
-                                            })),
-                                        ),
-                                ),
-                        )
-                    })),
+
+                        // Render visible items
+                        range
+                            .filter_map(|row_ix| {
+                                let item = view.semantic_items.get(row_ix)?;
+                                Some(view.render_semantic_item(item, cx))
+                            })
+                            .collect()
+                    }),
+                )
+                .with_sizing_behavior(ListSizingBehavior::Infer)
+                .track_scroll(self.semantic_scroll_handle.clone()),
             )
-            .when(self.semantic_editing.is_some(), |page| {
-                page.child(
+            .into_any_element()
+    }
+
+    fn render_semantic_item(&self, item: &memelith_core::ImageSemantics, cx: &mut Context<Self>) -> AnyElement {
+        let id = item.content_id;
+        let is_editing = self.semantic_editing == Some(id);
+        let is_selected = self.semantic_selected_items.contains(&id);
+
+        let mut container = div()
+            .id(SharedString::from(format!("semantic-item-{id}")))
+            .flex()
+            .flex_col()
+            .py_3()
+            .border_b_1()
+            .border_color(rgba(LABEL_3))
+            .when(is_selected, |div| div.bg(rgba(0x3B6DFF10)));
+
+        // Main content row (checkbox + image + info)
+        let mut row = div().flex().gap_4();
+
+        // Checkbox for batch selection
+        let checkbox_id_elem = ElementId::Name(format!("semantic-checkbox-{}", id).into());
+        let checkbox_id = id.clone();
+        row = row.child(
+            div()
+                .id(checkbox_id_elem)
+                .w(px(24.))
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .size(px(18.))
+                        .border_1()
+                        .border_color(rgba(LABEL_2))
+                        .rounded(px(4.))
+                        .when(is_selected, |inner| {
+                            inner
+                                .bg(rgb(ACCENT))
+                                .border_color(rgb(ACCENT))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .text_color(rgb(0xffffff))
+                                .child("✓")
+                        })
+                )
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    if view.semantic_selected_items.contains(&checkbox_id) {
+                        view.semantic_selected_items.remove(&checkbox_id);
+                    } else {
+                        view.semantic_selected_items.insert(checkbox_id);
+                    }
+                    cx.notify();
+                })),
+        );
+
+        if let Some(root) = &self.storage_root {
+            row = row.child(
+                img(root.join(&item.relative_path))
+                    .w(px(128.))
+                    .h(px(128.))
+                    .object_fit(ObjectFit::Contain),
+            );
+        }
+
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_sm().child(format!(
+                    "{} · {} · 索引 {}",
+                    item.relative_path.display(),
+                    item.status,
+                    item.embedding_status
+                )))
+                .child(
+                    div()
+                        .text_sm()
+                        .child(item.caption.clone().unwrap_or_default()),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .child(item.visible_text.clone().unwrap_or_default()),
+                )
+                .children(item.reclassification_history.iter().rev().map(
+                    |record| {
+                        div().text_xs().text_color(rgba(LABEL_2)).child(format!(
+                            "{} · {} → {} · {}",
+                            record.at,
+                            record.from_category,
+                            record.to_category,
+                            record.reason
+                        ))
+                    },
+                ))
+                .child(div().text_xs().text_color(rgba(LABEL_2)).child(format!(
+                    "{} {} {}",
+                    item.category_review_reason.as_deref().unwrap_or(""),
+                    item.suggested_category.as_deref().unwrap_or(""),
+                    item.embedding_error
+                        .as_deref()
+                        .or(item.error.as_deref())
+                        .unwrap_or("")
+                )))
+                .child(
                     div()
                         .flex()
-                        .flex_col()
+                        .flex_wrap()
                         .gap_2()
-                        .child(self.semantic_caption_input.clone())
-                        .child(self.semantic_tags_input.clone())
-                        .child(self.semantic_ocr_input.clone())
-                        .child(
-                            div().flex().gap_2().children(
-                                [
-                                    (ImageType::Unknown, "未知"),
-                                    (ImageType::Sticker, "Sticker"),
-                                    (ImageType::Illustration, "插画"),
-                                ]
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, (kind, label))| {
-                                    glass_pill(("semantic-edit-type", index))
-                                        .child(label)
-                                        .when(self.semantic_edit_type == kind, |button| {
-                                            button.bg(rgb(ACCENT)).text_color(rgb(0xffffff))
-                                        })
-                                        .on_click(cx.listener(move |view, _, _, cx| {
-                                            view.semantic_edit_type = kind;
-                                            cx.notify();
+                        .children(
+                            [
+                                (ImageType::Unknown, "未知"),
+                                (ImageType::Sticker, "Sticker"),
+                                (ImageType::Illustration, "插画"),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(
+                                |(index, (kind, label))| {
+                                    glass_pill(SharedString::from(format!(
+                                        "semantic-type-{id}-{index}"
+                                    )))
+                                    .child(label)
+                                    .when(item.image_type == kind, |button| {
+                                        button
+                                            .bg(rgb(ACCENT))
+                                            .text_color(rgb(0xffffff))
+                                    })
+                                    .when(!is_editing, |button| {
+                                        button.on_click(cx.listener(move |view, _, _, cx| {
+                                            if let Some(database) = view.database.clone() {
+                                                let result = database
+                                                    .lock()
+                                                    .map_err(|_| "数据库锁已损坏".to_owned())
+                                                    .and_then(|mut database| {
+                                                        database
+                                                            .resolve_image_review(id, kind)
+                                                            .map_err(|e| e.to_string())
+                                                    });
+                                                if let Err(error) = result {
+                                                    view.notice = Some(Notice::Error(error));
+                                                }
+                                                view.refresh_semantic_items(cx);
+                                                view.schedule_semantic_rebuild(cx);
+                                                cx.notify();
+                                            }
                                         }))
-                                }),
+                                    })
+                                },
                             ),
                         )
-                        .child(self.semantic_review_input.clone())
                         .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    glass_pill("semantic-propose-revision")
-                                        .child(if self.semantic_revising {
-                                            "复审中"
-                                        } else {
-                                            "重新分析"
-                                        })
-                                        .when(!self.semantic_revising, |button| {
-                                            button.on_click(cx.listener(|view, _, _, cx| {
-                                                view.propose_semantic_revision(cx)
-                                            }))
-                                        }),
-                                )
-                                .child(primary_pill("semantic-save-edit").child("保存").on_click(
-                                    cx.listener(|view, _, _, cx| view.save_semantic_edit(cx)),
-                                ))
-                                .child(glass_pill("semantic-cancel-edit").child("取消").on_click(
-                                    cx.listener(|view, _, _, cx| {
+                            glass_pill(SharedString::from(format!("semantic-edit-{id}")))
+                                .child(if is_editing { "取消编辑" } else { "编辑" })
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    if view.semantic_editing == Some(id) {
                                         view.semantic_editing = None;
-                                        cx.notify();
-                                    }),
-                                )),
+                                    } else {
+                                        view.edit_semantic_item(id, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            glass_pill(SharedString::from(format!("semantic-retry-{id}")))
+                                .child("重试")
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.start_vlm_jobs(vec![id], cx);
+                                    cx.notify();
+                                })),
                         ),
-                )
-            })
-            .into_any_element()
+                ),
+        );
+
+        container = container.child(row);
+
+        // Inline edit form when editing this item
+        if is_editing {
+            container = container.child(
+                div()
+                    .mt_4()
+                    .pl(px(128. + 16.)) // Align with text content
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgba(LABEL_2)).child("Caption"))
+                            .child(self.semantic_caption_input.clone())
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgba(LABEL_2)).child("Tags"))
+                            .child(self.semantic_tags_input.clone())
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgba(LABEL_2)).child("OCR Text"))
+                            .child(self.semantic_ocr_input.clone())
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgba(LABEL_2)).child("图片类型"))
+                            .child(
+                                div().flex().gap_2().children(
+                                    [
+                                        (ImageType::Unknown, "未知"),
+                                        (ImageType::Sticker, "Sticker"),
+                                        (ImageType::Illustration, "插画"),
+                                    ]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, (kind, label))| {
+                                        glass_pill(("semantic-edit-type", index))
+                                            .child(label)
+                                            .when(self.semantic_edit_type == kind, |button| {
+                                                button.bg(rgb(ACCENT)).text_color(rgb(0xffffff))
+                                            })
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.semantic_edit_type = kind;
+                                                cx.notify();
+                                            }))
+                                    }),
+                                ),
+                            )
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgba(LABEL_2)).child("审查备注"))
+                            .child(self.semantic_review_input.clone())
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                glass_pill("semantic-propose-revision")
+                                    .child(if self.semantic_revising {
+                                        "复审中"
+                                    } else {
+                                        "重新分析"
+                                    })
+                                    .when(!self.semantic_revising, |button| {
+                                        button.on_click(cx.listener(|view, _, _, cx| {
+                                            view.propose_semantic_revision(cx)
+                                        }))
+                                    }),
+                            )
+                            .child(primary_pill("semantic-save-edit").child("保存").on_click(
+                                cx.listener(|view, _, _, cx| view.save_semantic_edit(cx)),
+                            )),
+                    ),
+            );
+        }
+
+        container.into_any_element()
     }
 
     fn start_vlm_jobs(&mut self, content_ids: Vec<Uuid>, cx: &mut Context<Self>) {
@@ -3169,7 +3459,7 @@ impl MemelithView {
                             return false;
                         }
                         view.semantic_job_progress.0 = index + 1;
-                        view.refresh_semantic_items();
+                        view.refresh_semantic_items(cx);
                         cx.notify();
                         true
                     })
@@ -3195,7 +3485,7 @@ impl MemelithView {
                         errors.len()
                     )));
                 }
-                view.refresh_semantic_items();
+                view.refresh_semantic_items(cx);
                 let queued = std::mem::take(&mut view.semantic_job_queue);
                 if !queued.is_empty() {
                     view.start_vlm_jobs(queued, cx);
@@ -3637,7 +3927,7 @@ impl MemelithView {
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
         if page == Page::Semantics {
-            self.refresh_semantic_items();
+            self.refresh_semantic_items(cx);
         }
         if matches!(page, Page::Collector | Page::All | Page::MemePacks)
             && !self.analyzing_images
