@@ -94,7 +94,7 @@ fn migrates_actual_v1_schema_without_changing_legacy_data() {
             connection
                 .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            5
+            6
         );
         let original_embedding: Vec<u8> = connection
             .query_row(
@@ -297,7 +297,7 @@ fn v2_migration_preserves_captions_and_recovers_interrupted_embedding_jobs() {
     assert_eq!(
         raw.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        5
+        6
     );
     raw.execute(
         "UPDATE image_semantic_state SET embedding_status='running' WHERE content_id=?1",
@@ -1796,7 +1796,7 @@ fn enforces_embedding_compatibility_schema_version_and_media_integrity() {
     assert!(matches!(
         MemeDatabase::open(&storage, FakeEmbeddingProvider::valid()),
         Err(Error::UnsupportedSchemaVersion {
-            expected: 5,
+            expected: 6,
             actual: 99
         })
     ));

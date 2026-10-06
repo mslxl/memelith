@@ -19,7 +19,7 @@ use crate::{
     SimilarMemeImage, Tag, UpdateImageSemantics, UpdateMemeMetadata, UpdateMemePack,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const CONTENT_HASH_BYTES: usize = 32;
 const DATABASE_FILENAME: &str = "memelith.sqlite3";
 const MEDIA_DIRECTORY: &str = "media/images";
@@ -626,12 +626,166 @@ impl MemeDatabase {
     }
 
     pub fn list_image_semantics(&self, pack_id: Option<Uuid>) -> Result<Vec<ImageSemantics>> {
-        let ids = self.connection.prepare("SELECT c.id FROM meme_contents c JOIN memes m ON m.id=c.meme_id WHERE c.kind IN ('image','motion') AND (?1 IS NULL OR m.meme_pack_id=?1) ORDER BY c.rowid DESC")?
-            .query_map([pack_id.map(|id| id.to_string())], |r| uuid_from_column(r,0))?
-            .collect::<std::result::Result<Vec<_>,_>>()?;
-        ids.into_iter()
-            .map(|id| self.get_image_semantics(id))
-            .collect()
+        self.list_image_semantics_page(pack_id, false, None, None, 0, usize::MAX)
+    }
+
+    pub fn list_image_semantics_page(
+        &self,
+        pack_id: Option<Uuid>,
+        review_only: bool,
+        type_filter: Option<ImageType>,
+        status_filter: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ImageSemantics>> {
+        // `list_image_semantics` passes `usize::MAX` to mean "no limit", but SQLite
+        // only accepts a signed 64-bit LIMIT, so saturate rather than fail.
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
+
+        // Build WHERE conditions and their bound parameters together, in the same
+        // order, so the positional placeholders below always line up.
+        let mut where_clauses = vec!["c.kind IN ('image', 'motion')".to_owned()];
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(pack_id) = pack_id {
+            where_clauses.push("m.meme_pack_id = ?".to_owned());
+            params_vec.push(Box::new(pack_id.to_string()));
+        }
+        if review_only {
+            where_clauses.push(
+                "(c.image_review_status = 'needs_review' \
+                 OR (c.image_type = 'unknown' AND c.image_review_status != 'confirmed'))"
+                    .to_owned(),
+            );
+        }
+        if let Some(image_type) = type_filter {
+            where_clauses.push("c.image_type = ?".to_owned());
+            params_vec.push(Box::new(image_type.as_database_str().to_owned()));
+        }
+        // `semantic_status` lives on meme_contents; image_semantic_state only
+        // carries `embedding_status`.
+        match status_filter {
+            Some("pending") => where_clauses.push(
+                "(c.semantic_status = 'pending' \
+                 OR COALESCE(s2.embedding_status, 'pending') = 'pending')"
+                    .to_owned(),
+            ),
+            Some("done") => where_clauses.push(
+                "(c.semantic_status = 'done' \
+                 AND COALESCE(s2.embedding_status, 'pending') = 'done')"
+                    .to_owned(),
+            ),
+            Some("failed") => where_clauses.push(
+                "(c.semantic_status = 'failed' OR s2.embedding_status = 'failed')".to_owned(),
+            ),
+            _ => {}
+        }
+
+        let where_clause = where_clauses.join(" AND ");
+
+        // Select the page of content rows first, then join the one-to-many history
+        // table so the LIMIT applies to contents rather than to history rows.
+        // `rowid` is projected explicitly because a derived table does not expose
+        // the underlying table's rowid to the outer query.
+        let query = format!(
+            "SELECT
+                c.id, c.meme_id, c.relative_path, c.image_type, c.image_type_source,
+                c.image_review_status, c.semantic_caption, c.semantic_tags, c.visible_text,
+                c.semantic_status, c.semantic_error, c.semantic_prompt_version,
+                c.semantic_embedding_provider, c.semantic_embedding_model,
+                c.semantic_embedding_dimension, c.semantic_text_hash,
+                s.category_fit, s.category_review_reason, s.suggested_category,
+                COALESCE(s.provenance, 'automatic') as provenance,
+                COALESCE(s.embedding_status, 'pending') as embedding_status,
+                s.embedding_error, COALESCE(s.index_version, 1) as index_version,
+                s.built_at,
+                h.from_category, h.to_category, h.reason, h.status, h.at
+            FROM (
+                SELECT c.rowid AS source_rowid, c.* FROM meme_contents c
+                JOIN memes m ON m.id = c.meme_id
+                LEFT JOIN image_semantic_state s2 ON s2.content_id = c.id
+                WHERE {where_clause}
+                ORDER BY c.rowid DESC
+                LIMIT ? OFFSET ?
+            ) c
+            LEFT JOIN image_semantic_state s ON s.content_id = c.id
+            LEFT JOIN image_category_history h ON h.content_id = c.id
+            ORDER BY c.source_rowid DESC, h.id ASC"
+        );
+
+        let mut stmt = self.connection.prepare(&query)?;
+        params_vec.push(Box::new(limit_i64));
+        params_vec.push(Box::new(offset_i64));
+
+        // Group results in memory (one content_id may have multiple history rows)
+        let mut items_map = std::collections::HashMap::<Uuid, ImageSemantics>::new();
+        let mut order = Vec::new();
+
+        let params: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|value| &**value as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let content_id = uuid_from_column(row, 0)?;
+
+            // If this is a new content_id, create the ImageSemantics record
+            let item = items_map.entry(content_id).or_insert_with(|| {
+                order.push(content_id);
+                let tags = row
+                    .get::<_, Option<String>>(7)
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "[]".to_owned());
+                let tags: Vec<String> = serde_json::from_str(&tags).unwrap_or_default();
+
+                ImageSemantics {
+                    content_id,
+                    meme_id: uuid_from_column(row, 1).unwrap(),
+                    relative_path: PathBuf::from(row.get::<_, String>(2).unwrap()),
+                    image_type: ImageType::from_database_str(&row.get::<_, String>(3).unwrap()),
+                    image_type_source: row.get(4).unwrap(),
+                    image_review_status: row.get(5).unwrap(),
+                    caption: row.get(6).unwrap(),
+                    semantic_tags: tags,
+                    visible_text: row.get(8).unwrap(),
+                    status: row.get(9).unwrap(),
+                    error: row.get(10).unwrap(),
+                    prompt_version: row.get(11).unwrap(),
+                    embedding_provider: row.get(12).unwrap(),
+                    embedding_model: row.get(13).unwrap(),
+                    embedding_dimension: row.get::<_, Option<i64>>(14)
+                        .unwrap_or(None)
+                        .and_then(|v| usize::try_from(v).ok()),
+                    text_hash: row.get(15).unwrap(),
+                    category_fit: row.get(16).unwrap(),
+                    category_review_reason: row.get(17).unwrap(),
+                    suggested_category: row.get(18).unwrap(),
+                    provenance: row.get(19).unwrap(),
+                    embedding_status: row.get(20).unwrap(),
+                    embedding_error: row.get(21).unwrap(),
+                    index_version: row.get(22).unwrap(),
+                    built_at: row.get(23).unwrap(),
+                    reclassification_history: Vec::new(),
+                }
+            });
+
+            // If this row has history data, append it
+            if let Some(from_cat) = row.get::<_, Option<String>>(24)? {
+                item.reclassification_history.push(crate::CategoryReclassification {
+                    from_category: from_cat,
+                    to_category: row.get(25)?,
+                    reason: row.get(26)?,
+                    status: row.get(27)?,
+                    at: row.get(28)?,
+                });
+            }
+
+            Ok(())
+        })?;
+
+        // Consume all rows
+        rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Return items in original order
+        Ok(order.into_iter().filter_map(|id| items_map.remove(&id)).collect())
     }
 
     pub fn rebuild_pending_semantics(&mut self) -> Result<usize> {
@@ -2687,28 +2841,37 @@ fn initialize_database(
             create_schema(connection, model_id, embedding_dimension)?;
             migrate_schema_v2_to_v3(connection)?;
             migrate_schema_v3_to_v4(connection)?;
-            migrate_schema_v4_to_v5(connection)
+            migrate_schema_v4_to_v5(connection)?;
+            migrate_schema_v5_to_v6(connection)
         }
         1 => {
             migrate_schema_v1_to_v2(connection)?;
             migrate_schema_v2_to_v3(connection)?;
             migrate_schema_v3_to_v4(connection)?;
             migrate_schema_v4_to_v5(connection)?;
+            migrate_schema_v5_to_v6(connection)?;
             validate_database_metadata(connection, model_id, embedding_dimension)
         }
         2 => {
             migrate_schema_v2_to_v3(connection)?;
             migrate_schema_v3_to_v4(connection)?;
             migrate_schema_v4_to_v5(connection)?;
+            migrate_schema_v5_to_v6(connection)?;
             validate_database_metadata(connection, model_id, embedding_dimension)
         }
         3 => {
             migrate_schema_v3_to_v4(connection)?;
             migrate_schema_v4_to_v5(connection)?;
+            migrate_schema_v5_to_v6(connection)?;
             validate_database_metadata(connection, model_id, embedding_dimension)
         }
         4 => {
             migrate_schema_v4_to_v5(connection)?;
+            migrate_schema_v5_to_v6(connection)?;
+            validate_database_metadata(connection, model_id, embedding_dimension)
+        }
+        5 => {
+            migrate_schema_v5_to_v6(connection)?;
             validate_database_metadata(connection, model_id, embedding_dimension)
         }
         SCHEMA_VERSION => validate_database_metadata(connection, model_id, embedding_dimension),
@@ -2987,6 +3150,29 @@ fn migrate_schema_v4_to_v5(connection: &mut Connection) -> Result<()> {
     }
     transaction.pragma_update(None, "user_version", 5)?;
     transaction.execute("UPDATE metadata SET schema_version = 5", [])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_schema_v5_to_v6(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "-- Optimize semantic review queries: filter by kind, status, and review status.
+        -- `rowid` cannot be named as an index column, so the trailing sort key is
+        -- deliberately omitted; the leading equality columns do the filtering.
+        CREATE INDEX IF NOT EXISTS meme_contents_semantic_review
+            ON meme_contents(kind, semantic_status, image_review_status);
+
+        -- Optimize semantic state lookups during JOIN
+        CREATE INDEX IF NOT EXISTS image_semantic_state_embedding
+            ON image_semantic_state(embedding_status);
+
+        -- Optimize category history queries
+        CREATE INDEX IF NOT EXISTS image_category_history_status
+            ON image_category_history(status, at DESC);",
+    )?;
+    transaction.pragma_update(None, "user_version", 6)?;
+    transaction.execute("UPDATE metadata SET schema_version = 6", [])?;
     transaction.commit()?;
     Ok(())
 }
